@@ -22,7 +22,9 @@ jobs:
       SECRET_MASTER_KEY: ci-only-envelope-key-with-at-least-32-random-bytes
       ROOT_PASSWORD: CI-Root-Password-Not-Used-123!
       AUTH_COOKIE_SECURE: "true"
-      APP_DATA_DIR: ${{ runner.temp }}/agent-data
+      # Job-level env is evaluated before a runner exists, so runner.temp is not
+      # available here. This ignored workspace path is valid on Ubuntu/Windows.
+      APP_DATA_DIR: ${{ github.workspace }}/data_harness_test
       JOB_WORKER_ENABLED: "false"
       CRON_SCHEDULER_ENABLED: "false"
     steps:
