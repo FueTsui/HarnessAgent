@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>__BRAND_DOCUMENT_TITLE__</title>
+  <link id="brand-favicon" rel="icon" href="__BRAND_LOGO_URL__" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body class="admin-page">
+  <header class="topbar">
+    <h1 id="brand-title">__BRAND_MARKUP__</h1>
+    <div class="admin-context"><strong>设置</strong><span>Harness Control Plane</span></div>
+    <div class="right" id="topbar-right"></div>
+  </header>
+  <div class="app-shell">
+    <aside class="sidebar admin-sidebar" aria-label="设置导航">
+      <nav class="tabs" aria-label="设置模块">
+        <button type="button" class="tab active" data-tab="agents" aria-current="page"><span class="ti" data-icon="bot"></span><span>智能体</span></button>
+        <button type="button" class="tab" data-tab="providers"><span class="ti" data-icon="server"></span><span>模型</span></button>
+        <button type="button" class="tab root-only" data-tab="operations"><span class="ti" data-icon="activity"></span><span>运行中心</span></button>
+        <button type="button" class="tab" data-tab="improvement"><span class="ti" data-icon="flask"></span><span>改进实验室</span></button>
+        <button type="button" class="tab" data-tab="knowledge"><span class="ti" data-icon="database"></span><span>知识库</span></button>
+        <button type="button" class="tab" data-tab="skills"><span class="ti" data-icon="package"></span><span>Skills</span></button>
+        <button type="button" class="tab" data-tab="mcp"><span class="ti" data-icon="plug"></span><span>MCP</span></button>
+        <button type="button" class="tab root-only" data-tab="capabilities"><span class="ti" data-icon="blocks"></span><span>内置能力</span></button>
+        <button type="button" class="tab" data-tab="templates"><span class="ti" data-icon="fileText"></span><span>模板</span></button>
+        <button type="button" class="tab" data-tab="schedules"><span class="ti" data-icon="calendarClock"></span><span>定时任务</span></button>
+        <button type="button" class="tab" data-tab="channels"><span class="ti" data-icon="webhook"></span><span>消息渠道</span></button>
+        <button type="button" class="tab" data-tab="keys"><span class="ti" data-icon="key"></span><span>API 密钥</span></button>
+        <button type="button" class="tab" data-tab="token-usage"><span class="ti" data-icon="chart"></span><span>Token 用量</span></button>
+        <button type="button" class="tab" data-tab="archive"><span class="ti" data-icon="archive"></span><span>归档</span></button>
+        <button type="button" class="tab root-only" data-tab="users"><span class="ti" data-icon="users"></span><span>用户</span></button>
+        <button type="button" class="tab root-only" data-tab="settings"><span class="ti" data-icon="settings"></span><span>系统设置</span></button>
+        <button type="button" class="tab root-only" data-tab="audit"><span class="ti" data-icon="clipboardList"></span><span>操作日志</span></button>
+      </nav>
+    </aside>
+    <main class="content">
+      <section id="panel-agents" class="admin-panel">
+        <div class="section-heading">
+          <div><div class="section-kicker">AGENT RUNTIME</div><h2>智能体</h2><p>配置身份、能力与不可变 Harness 版本。每次变更都会形成可审计的新版本。</p></div>
+          <div class="section-actions">
+            <button class="btn ghost" id="agent-import"><span data-icon="paperclip"></span>导入配置</button>
+            <button class="btn ghost" id="agent-export"><span data-icon="external"></span>导出所选</button>
+            <button class="btn" id="new-agent"><span data-icon="plus"></span>新建智能体</button>
+            <input type="file" id="agent-import-input" accept=".json,application/json" hidden />
+          </div>
+        </div>
+        <div class="card-grid" id="agents-grid"></div>
+      </section>
+
+      <section id="panel-improvement" class="admin-panel" hidden>
+        <div class="section-heading">
+          <div><div class="section-kicker">EVIDENCE-DRIVEN CHANGE</div><h2>改进实验室</h2><p>从运行证据提出最小变更；评估通过且人工批准后才发布。</p></div>
+          <button class="btn" id="new-proposal"><span data-icon="plus"></span>新建提案</button>
+        </div>
+        <div class="lab-grid">
+          <div><h3>最近运行</h3><div id="runs-list" class="stack-list"></div></div>
+          <div><h3>修改提案</h3><div id="proposals-list" class="stack-list"></div></div>
+        </div>
+      </section>
+
+      <section id="panel-operations" class="admin-panel" hidden>
+        <div class="section-heading">
+          <div><div class="section-kicker">RUNTIME OPERATIONS</div><h2>运行中心</h2><p>查看队列、Worker、Scheduler、Provider、工具与渠道健康；恢复操作始终保留原失败事实。</p></div>
+          <div class="section-actions">
+            <label class="operations-window">窗口
+              <select id="operations-hours"><option value="1">1 小时</option><option value="24" selected>24 小时</option><option value="168">7 天</option></select>
+            </label>
+            <button class="btn ghost" id="operations-refresh"><span data-icon="restore"></span>刷新</button>
+          </div>
+        </div>
+        <div id="operations-content" class="operations-dashboard"><div class="empty-state">正在加载运行状态…</div></div>
+      </section>
+
+      <section id="panel-resource" class="admin-panel" hidden>
+        <div class="section-heading">
+          <div><div class="section-kicker">PLATFORM RESOURCE</div><h2 id="resource-title"></h2><p id="resource-copy"></p></div>
+          <div class="section-actions" id="resource-actions">
+            <button class="btn ghost" id="resource-import"><span data-icon="paperclip"></span><span id="resource-import-label">导入</span></button>
+            <button class="btn danger" id="resource-clear" hidden><span data-icon="trash"></span><span id="resource-clear-label">清空</span></button>
+            <button class="btn ghost" id="resource-export"><span data-icon="external"></span><span id="resource-export-label">导出</span></button>
+            <button class="btn" id="resource-create"><span data-icon="plus"></span><span id="resource-create-label">新建</span></button>
+            <input type="file" id="resource-import-input" hidden />
+          </div>
+        </div>
+        <div class="card-grid" id="resource-grid"></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="agent-dialog">
+    <h3 id="agent-dialog-title">新建智能体</h3>
+    <label>名称</label><input id="agent-name" />
+    <label>用途说明</label><textarea id="agent-description"></textarea>
+    <label>开场白</label><input id="agent-opening" />
+    <label>系统指令</label><textarea id="agent-prompt" class="code-area"></textarea>
+    <label>模型提供商</label><select id="agent-provider"></select>
+    <fieldset class="routing-fieldset">
+      <legend>模型路由与故障切换</legend>
+      <label for="agent-route-strategy">路由策略</label>
+      <select id="agent-route-strategy">
+        <option value="fixed">固定主模型</option>
+        <option value="ordered">按顺序故障切换</option>
+        <option value="lowest_cost">健康候选中成本最低</option>
+      </select>
+      <label>备用 Provider（按勾选顺序）</label><div id="agent-provider-fallbacks" class="choice-grid"></div>
+      <div class="routing-health-grid">
+        <label>统计窗口（分钟）<input id="agent-health-lookback" type="number" min="1" max="10080" value="60" /></label>
+        <label>最少样本<input id="agent-health-min-samples" type="number" min="1" max="1000" value="3" /></label>
+        <label>最大错误率<input id="agent-health-error-rate" type="number" min="0.05" max="1" step="0.05" value="0.6" /></label>
+        <label>连续失败阈值<input id="agent-health-consecutive" type="number" min="1" max="100" value="3" /></label>
+      </div>
+      <small class="field-help">切换仅发生在尚未产生用户可见流式增量时；不会扩大 Provider 权限。</small>
+    </fieldset>
+    <label>Skills</label><div id="agent-skills" class="choice-grid"></div>
+    <label>MCP</label><div id="agent-mcp" class="choice-grid"></div>
+    <label>子智能体</label><div id="agent-children" class="choice-grid"></div>
+    <label>内置 Harness 能力</label><div id="agent-builtins" class="choice-grid"></div>
+    <div class="switch-row">
+      <label><input type="checkbox" id="agent-memory" /> 启用长期记忆</label>
+      <label><input type="checkbox" id="agent-public" /> 对用户开放</label>
+      <label><input type="checkbox" id="agent-enabled" checked /> 启用</label>
+    </div>
+    <div class="error" id="agent-error"></div>
+    <div class="dialog-actions">
+      <button class="btn ghost" data-close="agent-dialog">取消</button>
+      <button class="btn" id="agent-save">保存并发布新版本</button>
+    </div>
+  </dialog>
+
+  <dialog id="provider-price-dialog" class="compact-dialog">
+    <h3>追加模型价格版本</h3>
+    <p class="dialog-copy"><strong id="provider-price-name"></strong> · 单位为 USD / 百万 Token。保存会追加新版本，不改写历史价格。</p>
+    <div class="token-limit-fields">
+      <label for="provider-price-input">输入</label><input id="provider-price-input" type="number" min="0" step="0.000001" />
+      <label for="provider-price-output">输出</label><input id="provider-price-output" type="number" min="0" step="0.000001" />
+      <label for="provider-price-cached">缓存输入</label><input id="provider-price-cached" type="number" min="0" step="0.000001" />
+      <label for="provider-price-reasoning">推理输出</label><input id="provider-price-reasoning" type="number" min="0" step="0.000001" />
+      <label><input id="provider-price-priced" type="checkbox" checked /> 此版本可估算成本</label>
+    </div>
+    <div class="error" id="provider-price-error"></div>
+    <div class="dialog-actions">
+      <button class="btn ghost" data-close="provider-price-dialog">取消</button>
+      <button class="btn" id="provider-price-save">追加版本</button>
+    </div>
+  </dialog>
+
+  <dialog id="versions-dialog">
+    <h3 id="versions-title">Harness 版本</h3>
+    <div id="versions-list" class="stack-list"></div>
+    <div class="dialog-actions"><button class="btn ghost" data-close="versions-dialog">关闭</button></div>
+  </dialog>
+
+  <dialog id="resource-dialog" class="resource-dialog">
+    <h3 id="resource-dialog-title">新建资源</h3>
+    <p class="dialog-copy" id="resource-dialog-copy"></p>
+    <div class="form-grid" id="resource-fields"></div>
+    <div class="error" id="resource-error"></div>
+    <div class="dialog-actions">
+      <button class="btn ghost" data-close="resource-dialog">取消</button>
+      <button class="btn" id="resource-save">保存</button>
+    </div>
+  </dialog>
+
+  <dialog id="token-limit-dialog" class="compact-dialog token-limit-dialog">
+    <h3>设置 Token 用量限制</h3>
+    <p class="dialog-copy"><strong id="token-limit-username"></strong> · 限额单位为万 Token；输入 100 表示 100 万 Token。输入 0 表示不限额。</p>
+    <div class="token-limit-fields">
+      <label for="token-weekly-limit">每周上限（万 Token）</label>
+      <input id="token-weekly-limit" type="number" min="0" max="900000000000" step="0.0001" inputmode="decimal" />
+      <small>按 UTC 自然周统计；支持最多 4 位小数，例如 1.5 表示 1.5 万 Token。</small>
+      <label for="token-monthly-limit">每月上限（万 Token）</label>
+      <input id="token-monthly-limit" type="number" min="0" max="900000000000" step="0.0001" inputmode="decimal" />
+      <small>按 UTC 自然月统计，每月 1 日 00:00 自动进入新周期。</small>
+      <label for="token-total-limit">历史总量上限（万 Token）</label>
+      <input id="token-total-limit" type="number" min="0" max="900000000000" step="0.0001" inputmode="decimal" />
+      <small>统计全部历史 usage；周/月重置不会改变总量，0 表示不限额。</small>
+    </div>
+    <div class="error" id="token-limit-error"></div>
+    <div class="dialog-actions">
+      <button class="btn ghost" data-close="token-limit-dialog">取消</button>
+      <button class="btn" id="token-limit-save">保存限制</button>
+    </div>
+  </dialog>
+
+  <dialog id="result-dialog" class="result-dialog">
+    <h3 id="result-title">操作完成</h3>
+    <p class="dialog-copy" id="result-copy"></p>
+    <div class="secret-result" id="result-value"></div>
+    <div class="dialog-actions">
+      <button class="btn ghost" data-close="result-dialog">关闭</button>
+      <button class="btn" id="result-copy-button"><span data-icon="copy"></span>复制</button>
+    </div>
+  </dialog>
+
+  <dialog id="weixin-login-dialog" class="weixin-login-dialog">
+    <h3>连接个人微信</h3>
+    <p class="dialog-copy">使用手机微信扫描二维码并确认。凭据只会加密保存在服务端，此微信消息仅进入你的个人智能体空间。</p>
+    <div class="weixin-qr-wrap"><img id="weixin-qr-image" alt="微信连接二维码" /></div>
+    <p class="weixin-login-status" id="weixin-login-status" role="status">正在生成二维码…</p>
+    <div class="weixin-pair-code" id="weixin-pair-code" hidden>
+      <label for="weixin-pair-code-input">手机微信显示的数字配对码</label>
+      <div><input id="weixin-pair-code-input" inputmode="numeric" autocomplete="one-time-code" maxlength="12" /><button class="btn" id="weixin-pair-code-submit">提交</button></div>
+    </div>
+    <div class="dialog-actions">
+      <button class="btn ghost" data-close="weixin-login-dialog">稍后完成</button>
+      <button class="btn" id="weixin-qr-refresh">重新生成二维码</button>
+    </div>
+  </dialog>
+
+  <dialog id="proposal-dialog">
+    <h3>新建改进提案</h3>
+    <label>智能体</label><select id="proposal-agent"></select>
+    <label>假设与最小改动说明</label><textarea id="proposal-hypothesis"></textarea>
+    <label>提议的系统指令</label><textarea id="proposal-prompt" class="code-area"></textarea>
+    <label>证据 Turn ID（每行一个）</label><textarea id="proposal-evidence"></textarea>
+    <div class="error" id="proposal-error"></div>
+    <div class="dialog-actions">
+      <button class="btn ghost" data-close="proposal-dialog">取消</button>
+      <button class="btn" id="proposal-save">创建待评估提案</button>
+    </div>
+  </dialog>
+
+  <script src="/static/common.js"></script>
+  <script src="/static/admin.js"></script>
+</body>
+</html>

@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>__BRAND_DOCUMENT_TITLE__</title>
+  <link id="brand-favicon" rel="icon" href="__BRAND_LOGO_URL__" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body class="chat-page is-booting" aria-busy="true">
+  <button class="mobile-scrim" id="mobile-scrim" aria-label="关闭侧栏"></button>
+  <div class="chat-shell">
+    <aside class="chat-sidebar" id="sidebar" aria-label="对话导航">
+      <div class="sidebar-brand">
+        <div id="brand-title" class="brand-mark">__BRAND_MARKUP__</div>
+        <button class="icon-button" id="sidebar-toggle" title="收起侧栏" aria-label="收起侧栏">
+          <span data-icon="panel"></span>
+        </button>
+      </div>
+      <button class="new-thread" id="new-chat-btn">
+        <span class="nav-icon" data-icon="plus"></span><span>新对话</span>
+        <kbd>Ctrl K</kbd>
+      </button>
+      <div class="history-search">
+        <span data-icon="search" data-icon-size="16"></span>
+        <input id="history-search" placeholder="搜索对话" autocomplete="off" aria-label="搜索对话" />
+      </div>
+      <section class="sidebar-section pinned-section" id="pinned-section" hidden>
+        <div class="sidebar-label sidebar-section-head pinned-section-head">
+          <button class="sidebar-section-toggle section-title-toggle" id="pinned-section-toggle" aria-expanded="true">
+            <span>置顶</span><span class="section-chevron" data-icon="chevronDown" data-icon-size="13"></span>
+          </button>
+        </div>
+        <div class="project-list pinned-project-list" id="pinned-project-list"></div>
+      </section>
+      <section class="sidebar-section" id="project-section">
+        <div class="sidebar-label sidebar-section-head project-section-head">
+          <button class="sidebar-section-toggle section-title-toggle" id="project-section-toggle" aria-expanded="true">
+            <span>项目</span><span class="section-chevron" data-icon="chevronDown" data-icon-size="13"></span>
+          </button>
+          <span class="section-head-actions project-section-actions">
+            <button class="sidebar-action-button" id="new-project-btn" title="新建项目" aria-label="新建项目"><span data-icon="plus" data-icon-size="15"></span></button>
+          </span>
+        </div>
+        <div class="project-list" id="project-list">
+          <div class="sidebar-loading" aria-hidden="true">
+            <span></span><span></span>
+          </div>
+        </div>
+      </section>
+      <section class="sidebar-section recent-section" id="recent-section">
+        <div class="sidebar-label sidebar-section-head recent-section-head">
+          <button class="sidebar-section-toggle section-title-toggle" id="recent-section-toggle" aria-expanded="true">
+            <span id="history-label">最近</span>
+            <span class="section-chevron" data-icon="chevronDown" data-icon-size="13"></span>
+          </button>
+          <span class="section-head-actions recent-section-actions">
+            <button class="sidebar-action-button section-more-button" id="recent-more-btn" title="最近对话显示选项" aria-label="最近对话显示选项" aria-haspopup="menu" aria-expanded="false">•••</button>
+            <button class="sidebar-action-button" id="recent-new-chat-btn" title="新建对话" aria-label="新建对话"><span data-icon="edit" data-icon-size="14"></span></button>
+          </span>
+          <div class="section-options-menu recent-section-menu" id="recent-section-menu" role="menu" hidden>
+            <div class="section-menu-label">排序方式</div>
+            <button id="recent-sort-priority" class="menu-choice" role="menuitemradio"><span class="menu-check" data-icon="check" data-icon-size="13"></span><span>置顶优先</span></button>
+            <button id="recent-sort-updated" class="menu-choice" role="menuitemradio"><span class="menu-check" data-icon="check" data-icon-size="13"></span><span>最近更新</span></button>
+          </div>
+        </div>
+        <div class="thread-list" id="history-panel">
+          <div class="sidebar-loading" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </div>
+        </div>
+      </section>
+      <div class="sidebar-account">
+        <div class="avatar" id="user-avatar">U</div>
+        <div class="account-copy">
+          <strong id="account-name"></strong>
+          <span id="account-role"></span>
+        </div>
+        <button class="icon-button more-button" id="account-menu-btn" aria-label="账户菜单">•••</button>
+        <div class="account-menu" id="account-menu" role="menu">
+          <a href="/admin" id="admin-link" role="menuitem"><span data-icon="settings"></span>设置</a>
+          <button id="theme-toggle" role="menuitem"><span data-theme-icon></span><span>切换外观</span></button>
+          <button id="change-password-btn" role="menuitem"><span data-icon="key"></span>修改密码</button>
+          <button class="danger-text" id="logout-btn" role="menuitem"><span data-icon="logout"></span>退出登录</button>
+        </div>
+      </div>
+    </aside>
+
+    <main class="conversation-pane">
+      <div class="attachment-drop-overlay" id="attachment-drop-overlay" aria-hidden="true">
+        <div class="attachment-drop-card">
+          <span data-icon="paperclip" data-icon-size="24"></span>
+          <strong>松开即可添加附件</strong>
+          <small>文件会加入当前对话，发送前仍可移除</small>
+        </div>
+      </div>
+      <header class="conversation-header">
+        <button class="icon-button desktop-sidebar-expand" id="sidebar-expand" aria-label="展开侧栏" title="展开侧栏" hidden>
+          <span data-icon="panel"></span>
+        </button>
+        <button class="icon-button mobile-only" id="mobile-sidebar" aria-label="打开侧栏">
+          <span data-icon="menu"></span>
+        </button>
+        <button class="agent-selector" id="agent-selector" aria-haspopup="menu" aria-expanded="false">
+          <span class="agent-selector-icon" data-icon="sparkles"></span>
+          <span class="agent-selector-copy">
+            <strong id="agent-name">选择智能体</strong>
+            <small id="agent-version">准备就绪</small>
+          </span>
+          <span class="chevron" data-icon="chevronDown" data-icon-size="15"></span>
+        </button>
+        <div class="agent-menu" id="agent-menu" role="menu"></div>
+        <div class="header-spacer"></div>
+        <div class="connection-state"><i></i><span>本地工作区</span></div>
+        <button class="header-action" id="details-toggle" title="运行详情" aria-label="查看运行详情">
+          <span data-icon="history"></span><span>运行详情</span>
+        </button>
+      </header>
+
+      <section class="messages" id="chat-log" aria-live="polite">
+        <div class="welcome" id="welcome">
+          <div class="welcome-logo" id="welcome-logo"><span data-icon="sparkles" data-icon-size="24"></span></div>
+          <h1 id="welcome-title">今天想完成什么？</h1>
+          <p id="welcome-copy">选择一个智能体并描述目标；复杂任务会生成可动态调整的计划，并实时展示当前步骤。</p>
+        </div>
+      </section>
+
+      <aside class="schedule-reminders" id="schedule-reminders" aria-live="polite" hidden>
+        <div class="schedule-reminders-head">
+          <span data-icon="history" data-icon-size="15"></span>
+          <div><strong>定时提醒</strong><small>结果追加到当前对话</small></div>
+        </div>
+        <div class="schedule-reminder-list" id="schedule-reminder-list"></div>
+      </aside>
+
+      <section class="composer-wrap">
+        <section class="turn-progress-dock" id="turn-progress-dock" aria-live="polite" hidden>
+          <div class="turn-progress-card" id="turn-progress-card" role="status"
+            aria-label="当前任务计划">
+            <div class="turn-progress-steps" id="turn-progress-steps" role="list"></div>
+          </div>
+          <button class="turn-progress-toggle" id="turn-progress-toggle" type="button"
+            aria-controls="turn-progress-card" aria-expanded="false"
+            title="悬停查看当前任务进度">
+            <i aria-hidden="true"></i>
+            <span id="turn-progress-count">第 1 / 1 步</span>
+          </button>
+        </section>
+        <div class="picker-popover command-palette" id="resource-picker" role="listbox"></div>
+        <div class="model-menu" id="model-menu" role="menu" aria-label="选择模型"></div>
+        <div class="approval-policy-menu" id="approval-policy-menu" role="menu" aria-label="选择批准策略">
+          <button type="button" data-approval-policy="ask" role="menuitemradio">
+            <span class="approval-policy-icon" data-icon="shield"></span>
+            <span><strong>请求批准</strong><small>所有有副作用的操作都会先征求你的批准</small></span>
+            <span class="approval-policy-check" data-icon="check" data-icon-size="16"></span>
+          </button>
+          <button type="button" data-approval-policy="auto" role="menuitemradio">
+            <span class="approval-policy-icon" data-icon="sparkles"></span>
+            <span><strong>帮我批准</strong><small>低风险工作区操作自动执行，外部或高风险操作仍会询问</small></span>
+            <span class="approval-policy-check" data-icon="check" data-icon-size="16"></span>
+          </button>
+          <button type="button" data-approval-policy="full_access" role="menuitemradio">
+            <span class="approval-policy-icon danger" data-icon="shield"></span>
+            <span><strong>完全访问权限</strong><small>不再逐次询问；既有工具授权、隔离工作区和平台安全边界仍然生效</small></span>
+            <span class="approval-policy-check" data-icon="check" data-icon-size="16"></span>
+          </button>
+        </div>
+        <div class="composer-add-menu" id="composer-add-menu" role="menu" aria-label="添加内容">
+          <label class="composer-menu-item" role="menuitem">
+            <span data-icon="paperclip"></span>
+            <span><strong>上传附件</strong><small>也可拖放文件或从剪贴板粘贴</small></span>
+            <input type="file" id="attach-input" multiple hidden />
+          </label>
+          <button class="composer-menu-item" id="mention-menu-btn" role="menuitem">
+            <span data-icon="at"></span>
+            <span><strong>引用内容</strong><small>选择知识库或模板</small></span>
+          </button>
+          <button class="composer-menu-item" id="command-btn" role="menuitem">
+            <b>/</b>
+            <span><strong>调用能力</strong><small>选择 Skill、MCP 或智能体</small></span>
+          </button>
+        </div>
+        <div class="composer">
+          <div class="message-staging" id="message-staging" aria-live="polite"></div>
+          <div class="composer-project-context" id="composer-project-context" aria-label="当前项目" hidden>
+            <span data-icon="folder" data-icon-size="15"></span>
+            <strong id="composer-project-name"></strong>
+          </div>
+          <div class="attachment-pills" id="attach-chips" aria-live="polite"></div>
+          <div class="composer-editor" id="composer-editor">
+            <div class="context-pills" id="mention-pills" aria-label="已引用和调用的内容，光标在正文开头时可按 Backspace 移除"></div>
+            <textarea id="query" rows="1" placeholder="随心输入" aria-label="消息内容"></textarea>
+          </div>
+          <div class="composer-toolbar">
+            <div class="composer-primary-actions">
+              <button class="composer-icon add-action" id="add-menu-btn" title="添加内容" aria-label="添加内容"
+                aria-haspopup="menu" aria-expanded="false">
+                <span data-icon="plus"></span>
+              </button>
+              <button class="composer-icon approval-policy-button" id="approval-policy-btn" title="批准策略"
+                aria-label="选择批准策略" aria-haspopup="menu" aria-expanded="false">
+                <span data-icon="shield" data-icon-size="15"></span>
+                <span class="approval-policy-label" id="approval-policy-label">请求批准</span>
+                <span data-icon="chevronDown" data-icon-size="11"></span>
+              </button>
+            </div>
+            <div class="composer-tools">
+              <button class="composer-icon model-select-button" id="model-btn" title="选择模型"
+                aria-label="选择模型" aria-haspopup="menu" aria-expanded="false">
+                <span data-icon="sparkles"></span>
+                <span class="model-select-label" id="model-btn-label">模型</span>
+                <span data-icon="chevronDown" data-icon-size="12"></span>
+              </button>
+              <button class="composer-icon" id="mic-btn" title="语音输入" aria-label="开始语音输入">
+                <span data-icon="mic"></span>
+              </button>
+              <button class="send-action" id="send-btn" title="开始语音输入" aria-label="开始语音输入">
+                <span data-icon="waveform"></span>
+              </button>
+            </div>
+          </div>
+        </div>
+        <p class="composer-hint">智能体可能会出错，请核验重要信息。</p>
+      </section>
+    </main>
+
+    <aside class="run-drawer" id="run-drawer">
+      <div class="drawer-head">
+        <div>
+          <span class="eyebrow">HARNESS OBSERVABILITY</span>
+          <strong>运行详情</strong>
+          <span id="run-status">尚未运行</span>
+        </div>
+        <button class="icon-button" id="drawer-close" aria-label="关闭运行详情"><span data-icon="close"></span></button>
+      </div>
+      <p class="drawer-copy">这里只展示可审计的执行事件、版本与结果状态，不暴露内部推理。</p>
+      <div class="run-summary" id="run-summary"></div>
+      <section class="evidence-center" id="evidence-center" aria-label="Evidence Tree" hidden></section>
+      <div class="run-events" id="run-events"></div>
+    </aside>
+  </div>
+
+  <div class="thread-context-menu" id="thread-context-menu" role="menu" hidden>
+    <button id="context-pin-btn" role="menuitem"><span data-icon="pin"></span><span id="context-pin-label">置顶</span></button>
+    <button id="context-rename-btn" role="menuitem"><span data-icon="edit"></span>重命名</button>
+    <button id="context-memory-btn" role="menuitem"><span data-icon="database"></span>记忆治理</button>
+    <button id="context-archive-btn" role="menuitem"><span data-icon="archive"></span>归档</button>
+  </div>
+
+  <div class="thread-context-menu" id="project-context-menu" role="menu" hidden>
+    <button id="project-context-pin-btn" role="menuitem"><span data-icon="pin"></span><span id="project-context-pin-label">置顶</span></button>
+    <button id="project-context-edit-btn" role="menuitem"><span data-icon="edit"></span>项目设置</button>
+    <button id="project-context-archive-btn" role="menuitem"><span data-icon="archive"></span>归档</button>
+  </div>
+
+  <dialog id="project-dialog" class="compact-dialog">
+    <h3 id="project-dialog-title">新建项目</h3>
+    <p class="dialog-copy">项目可集中管理同一主题下的对话，并提供默认 Agent、知识库和低权重背景。</p>
+    <label for="project-name">项目名称</label>
+    <input id="project-name" maxlength="80" placeholder="例如：产品发布计划" />
+    <label for="project-description">目标说明</label>
+    <textarea id="project-description" maxlength="500" placeholder="项目要达成什么结果"></textarea>
+    <label for="project-context">项目背景</label>
+    <textarea id="project-context" maxlength="8000" placeholder="仅作为用户层参考上下文，不会提升为系统指令"></textarea>
+    <label for="project-agent">默认智能体</label><select id="project-agent"><option value="">沿用当前选择</option></select>
+    <label>默认知识库</label><div id="project-datasets" class="choice-grid"></div>
+    <label><input id="project-default" type="checkbox" /> 设为默认项目</label>
+    <div class="error" id="project-error"></div>
+    <div class="dialog-actions">
+      <button class="btn ghost" id="project-cancel-btn">取消</button>
+      <button class="btn" id="project-create-btn">保存项目</button>
+    </div>
+  </dialog>
+
+  <dialog id="memory-dialog" class="compact-dialog memory-dialog">
+    <h3>对话记忆治理</h3>
+    <p class="dialog-copy">控制当前对话是否接收长期记忆，以及是否允许其内容成为其他对话的记忆来源。排除来源不会删除 Turn/Item 审计。</p>
+    <label><input id="memory-recall-enabled" type="checkbox" /> 当前对话允许召回长期记忆</label>
+    <label><input id="memory-source-enabled" type="checkbox" /> 当前对话可作为记忆来源</label>
+    <div id="memory-summary" class="memory-summary"></div>
+    <div class="dialog-actions">
+      <button class="btn ghost" id="memory-export-btn">导出我的记忆</button>
+      <button class="btn danger" id="memory-forget-btn">排除来源</button>
+      <button class="btn" id="memory-save-btn">保存</button>
+    </div>
+  </dialog>
+
+  <dialog id="rename-thread-dialog" class="compact-dialog">
+    <h3>重命名对话</h3>
+    <label for="rename-thread-name">对话名称</label>
+    <input id="rename-thread-name" maxlength="80" />
+    <div class="error" id="rename-thread-error"></div>
+    <div class="dialog-actions">
+      <button class="btn ghost" id="rename-thread-cancel">取消</button>
+      <button class="btn" id="rename-thread-save">保存</button>
+    </div>
+  </dialog>
+
+  <script src="/static/common.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

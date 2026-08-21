@@ -1,0 +1,26 @@
+# Local secrets and runtime data
+.env
+data/
+output/
+tmp/
+data_harness_test/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Generated/browser state
+browser_profiles/
+.playwright-cli/
+*.log
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
