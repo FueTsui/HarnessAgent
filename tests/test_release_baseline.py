@@ -36,6 +36,8 @@ class ReleaseBaselineTests(unittest.TestCase):
         self.assertIn("ubuntu-latest", workflow)
         self.assertIn("windows-latest", workflow)
         self.assertIn("python tools/release_preflight.py --skip-database", workflow)
+        self.assertIn("Prepare isolated runtime fixtures", workflow)
+        self.assertIn("APP_DATA_DIR'])/'branding'/'favicon.svg'", workflow)
         smoke = (
             release_preflight.ROOT / "tools" / "playwright_smoke.ps1"
         ).read_text(encoding="utf-8")
