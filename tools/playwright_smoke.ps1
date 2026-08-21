@@ -1,7 +1,8 @@
 param(
   [int]$Port = 8765,
   [string]$Python = "python",
-  [string]$RootPassword = "Browser-Smoke-Root-2026!"
+  [string]$RootPassword = "Browser-Smoke-Root-2026!",
+  [string]$PlaywrightCliPackage = "@playwright/cli@0.1.18"
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,7 +18,7 @@ New-Item -ItemType Directory -Force -Path $artifactRoot, $dataDir | Out-Null
 
 function Invoke-Pw {
   param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
-  $result = & npx --yes --package '@playwright/cli' playwright-cli --session $session @Arguments 2>&1 | Out-String
+  $result = & npx --yes --package $PlaywrightCliPackage playwright-cli --session $session @Arguments 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "playwright-cli failed: $result" }
   return $result
 }
@@ -47,11 +48,13 @@ try {
       $healthResponse = Invoke-WebRequest -Uri "$baseUrl/healthz" -TimeoutSec 2 -SkipHttpErrorCheck
       $health = $healthResponse.Content | ConvertFrom-Json
       if ($health.database.ok -and $health.migration.ok -and $health.migration.current -eq $health.migration.expected) { $healthy = $true; break }
-    } catch { Start-Sleep -Milliseconds 500 }
+    } catch {}
+    if ($server.HasExited) { throw "Service exited before becoming healthy" }
+    Start-Sleep -Milliseconds 500
   }
   if (-not $healthy) { throw "Service did not become healthy at $baseUrl" }
 
-  & npx --yes --package '@playwright/cli' playwright-cli install-browser chromium | Out-Null
+  & npx --yes --package $PlaywrightCliPackage playwright-cli install-browser chromium | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "Chromium installation failed" }
   Push-Location $artifactRoot
   try {

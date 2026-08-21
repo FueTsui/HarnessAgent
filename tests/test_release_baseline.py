@@ -25,6 +25,23 @@ from tools import release_preflight, sqlite_backup
 
 
 class ReleaseBaselineTests(unittest.TestCase):
+    def test_github_ci_triggers_and_pins_browser_cli(self):
+        workflow = (
+            release_preflight.ROOT / ".github" / "workflows" /
+            "security-regression.yml"
+        ).read_text(encoding="utf-8")
+        self.assertRegex(workflow, r"(?m)^on:\s*$")
+        for trigger in ("push:", "pull_request:", "workflow_dispatch:"):
+            self.assertIn(trigger, workflow)
+        self.assertIn("ubuntu-latest", workflow)
+        self.assertIn("windows-latest", workflow)
+        self.assertIn("python tools/release_preflight.py --skip-database", workflow)
+        smoke = (
+            release_preflight.ROOT / "tools" / "playwright_smoke.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn('@playwright/cli@0.1.18', smoke)
+        self.assertNotIn("--package '@playwright/cli'", smoke)
+
     def test_generated_runtime_artifacts_are_ignored(self):
         result = release_preflight.check_git(allow_unborn=True, allow_dirty=True)
         ignored = next(item for item in result if item.name == "generated-artifacts-ignore")
