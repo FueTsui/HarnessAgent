@@ -935,10 +935,12 @@ class ChatRuntimeRegressionTests(unittest.TestCase):
     def test_sample_word_template_replaces_original_body(self):
         from docx import Document
 
-        workspace = Path(__file__).resolve().parents[1]
-        source = workspace / "data" / "templates" / "_test_sample_replace.docx"
-        output = None
-        try:
+        # The repository data/ tree is intentionally ignored and absent on a
+        # fresh runner. Keep both the source template and rendered export inside
+        # one per-test directory and restore the module constant afterwards.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "sample-replace.docx"
             document = Document()
             document.add_paragraph("旧示例题：1 + 1 = 2")
             document.save(source)
@@ -947,22 +949,19 @@ class ChatRuntimeRegressionTests(unittest.TestCase):
                 "旧示例题",
                 template_capability.extract_reference_text(source, "word"),
             )
-            output = template_capability.render(
-                source,
-                "word",
-                {},
-                title="替换测试",
-                append_body="# 新试题\n1. 新生成的问题\n答案：A",
-                replace_body=True,
-            )
+            with patch.object(template_capability, "EXPORT_DIR", root):
+                output = template_capability.render(
+                    source,
+                    "word",
+                    {},
+                    title="替换测试",
+                    append_body="# 新试题\n1. 新生成的问题\n答案：A",
+                    replace_body=True,
+                )
             text = "\n".join(p.text for p in Document(output).paragraphs)
             self.assertNotIn("旧示例题", text)
             self.assertIn("新生成的问题", text)
             self.assertIn("答案：A", text)
-        finally:
-            source.unlink(missing_ok=True)
-            if output is not None:
-                output.unlink(missing_ok=True)
 
     def test_sample_ppt_template_keeps_pages_and_writes_paginated_answer(self):
         from pptx import Presentation

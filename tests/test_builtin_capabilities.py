@@ -150,16 +150,15 @@ def _image_pixels(image: Image.Image):
 
 class BuiltinCapabilityTests(unittest.TestCase):
     def setUp(self):
-        self.root = Path(__file__).resolve().parents[1] / "tmp" / "builtin_test_manual"
+        # Every test owns a real, already-created workspace. Do not depend on the
+        # repository's ignored tmp/ directory existing on a fresh CI checkout.
+        self._workspace = tempfile.TemporaryDirectory()
+        self.root = Path(self._workspace.name)
         self.prefix = "case_" + uuid.uuid4().hex
         self.ctx = builtin_tools.BuiltinToolContext(root=self.root, user_id=1, agent_id=1)
 
     def tearDown(self):
-        for path in self.root.glob(self.prefix + "*"):
-            try:
-                path.unlink()
-            except OSError:
-                pass
+        self._workspace.cleanup()
 
     def run_tool(self, name, args):
         return json.loads(asyncio.run(builtin_tools.execute(name, args, self.ctx)))
