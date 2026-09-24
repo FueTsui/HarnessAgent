@@ -43,7 +43,7 @@ jobs:
         run: python -m pip check
       - name: Prepare isolated runtime fixtures
         run: >-
-          python -c "import os; from pathlib import Path; p=Path(os.environ['APP_DATA_DIR'])/'branding'/'favicon.svg'; p.parent.mkdir(parents=True, exist_ok=True); p.write_text('ci-branding-fixture', encoding='utf-8')"
+          python -c "import os; from pathlib import Path; p=Path(os.environ['APP_DATA_DIR'])/'branding'/'favicon.svg'; p.parent.mkdir(parents=True, exist_ok=True); p.write_text('ci-branding-fixture', encoding='utf-8'); from backend.migrations import run_schema_migrations; run_schema_migrations()"
       - name: Run fail-closed release preflight without deployment database
         run: python tools/release_preflight.py --skip-database
       - name: Compile backend

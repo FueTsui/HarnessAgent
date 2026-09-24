@@ -49,7 +49,7 @@ class LoginRequiredTests(unittest.TestCase):
         for item in [patch.object(main, 'SessionLocal', self.factory), patch.object(chat, 'SessionLocal', self.factory),
                      patch.object(main, '_write_audit_log_safely'), patch.object(main, '_docs_branding', return_value=('Harness', ''))]:
             item.start(); self.addCleanup(item.stop)
-        self.client = TestClient(main.app, follow_redirects=False)
+        self.client = TestClient(main.app, base_url='https://testserver', follow_redirects=False)
         self.addCleanup(self.client.close)
         self.addCleanup(self.engine.dispose)
 
