@@ -64,6 +64,7 @@ def _resource_snapshot(resource_type: str | None, snapshot: dict) -> dict:
         allowed = {
             "name", "description_sha256", "transport", "risk_policy",
             "enabled", "is_public", "catalog_hash",
+            "connection_sha256",
         }
         return {key: clean[key] for key in allowed if key in clean}
     if resource_type == "skill":

@@ -5,20 +5,21 @@ import html
 import json
 import logging
 
-import jwt
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect, text
 from . import harness as harness_registry, jobs, scheduler, worker, weixin_channel
 from .api import (
-    agents, auth, capabilities, channels, chat, improvement, mcp, open_api,
+    agents, auth, capabilities, channels, chat, guardrails, improvement, mcp, open_api,
     model_governance, operations, providers, skills, templates, token_usage, users,
 )
 from .api import settings as settings_api
+from .api import services, memories, reasoning
+from .browser_access import cross_origin_cookie_write
 from .config import (
     BRANDING_DIR,
     DEFAULT_ROOT_PASSWORD,
@@ -94,6 +95,11 @@ async def job_quota_handler(_request, exc):
     return JSONResponse(status_code=429, content={"detail": str(exc)})
 
 
+@app.exception_handler(jobs.JobOwnerUnavailable)
+async def job_owner_unavailable_handler(_request, exc):
+    return JSONResponse(status_code=401, content={"detail": str(exc)})
+
+
 def _docs_branding() -> tuple[str, str]:
     db = SessionLocal()
     try:
@@ -160,6 +166,8 @@ if _cors_origins:
 @app.middleware("http")
 async def security_headers_middleware(request, call_next):
     response = await call_next(request)
+    if request.url.path.startswith("/api/v1/"):
+        response.headers.setdefault("Cache-Control", "no-store")
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "same-origin")
@@ -192,27 +200,17 @@ def _audit_identity(request):
     explicit = getattr(request.state, "audit_identity", None)
     if explicit is not None:
         return explicit
-    auth_header = request.headers.get("authorization") or ""
-    token = (
-        auth_header.split(" ", 1)[1].strip()
-        if auth_header.lower().startswith("bearer ")
-        else request.cookies.get(settings.AUTH_COOKIE_NAME, "")
-    )
-    if not token:
+    if not request.headers.get("authorization") and not request.cookies.get(settings.AUTH_COOKIE_NAME):
         return None, "", ""
+    from .security import resolve_request_user
+    db = SessionLocal()
     try:
-        payload = jwt.decode(
-            token,
-            settings.JWT_SECRET,
-            algorithms=[settings.JWT_ALGORITHM],
-        )
-        return (
-            int(payload["sub"]) if payload.get("sub") else None,
-            payload.get("username", ""),
-            payload.get("role", ""),
-        )
-    except Exception:
+        user = resolve_request_user(request, db)
+        return user.id, user.username, user.role
+    except HTTPException:
         return None, "", ""
+    finally:
+        db.close()
 
 
 def _write_audit_log(request, status_code: int) -> None:
@@ -256,7 +254,30 @@ async def audit_log_middleware(request, call_next):
     return response
 
 
+@app.middleware("http")
+async def browser_access_middleware(request, call_next):
+    if cross_origin_cookie_write(request):
+        _write_audit_log_safely(request, 403)
+        return JSONResponse(status_code=403, content={"detail": "不允许跨站提交，请返回当前工作区操作"}, headers={"Cache-Control": "no-store"})
+    if request.url.path.startswith("/api/v1/") and (
+        request.cookies.get(settings.AUTH_COOKIE_NAME) or request.headers.get("authorization")
+    ):
+        from .security import resolve_request_user
+        def identity():
+            with SessionLocal() as db:
+                try:
+                    user = resolve_request_user(request, db)
+                except HTTPException:
+                    return None
+                return user.id, user.username, user.role
+        actor = await asyncio.to_thread(identity)
+        if actor:
+            request.state.audit_identity = actor
+    return await call_next(request)
+
+
 app.include_router(auth.router)
+app.include_router(reasoning.router)
 app.include_router(users.router)
 app.include_router(agents.router)
 app.include_router(agents.keys_router)
@@ -267,6 +288,9 @@ app.include_router(skills.router)
 app.include_router(templates.router)
 app.include_router(settings_api.router)
 app.include_router(settings_api.audit_router)
+app.include_router(guardrails.router)
+app.include_router(services.router)
+app.include_router(memories.router)
 app.include_router(token_usage.router)
 app.include_router(model_governance.router)
 app.include_router(operations.router)
@@ -682,6 +706,8 @@ def init_data() -> None:
             logger.warning("已创建初始 root 账号：%s", settings.ROOT_USERNAME)
         _seed_core(db, root.id)
         db.commit()
+        from .knowledge_retirement import retire_legacy_datasets
+        retire_legacy_datasets(db)
     finally:
         db.close()
 
@@ -731,7 +757,13 @@ def _render_frontend_page(filename: str, title_prefix: str = "") -> HTMLResponse
 
 
 @app.get("/", include_in_schema=False)
-def index_page():
+def index_page(request: Request):
+    from .security import resolve_request_user
+    with SessionLocal() as db:
+        try:
+            resolve_request_user(request, db)
+        except HTTPException:
+            return RedirectResponse("/login", status_code=303)
     return _render_frontend_page("index.html")
 
 
@@ -741,5 +773,13 @@ def login_page():
 
 
 @app.get("/admin", include_in_schema=False)
-def admin_page():
+def admin_page(request: Request):
+    from .security import resolve_request_user
+    with SessionLocal() as db:
+        try:
+            user = resolve_request_user(request, db)
+        except HTTPException:
+            return RedirectResponse("/login?next=%2Fadmin", status_code=303)
+        if user.role == "guest":
+            return RedirectResponse("/login?next=%2Fadmin", status_code=303)
     return _render_frontend_page("admin.html", "设置 - ")

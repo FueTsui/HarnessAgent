@@ -1,0 +1,13 @@
+{
+  "name": "harness-agent-desktop",
+  "productName": "Harness Agent",
+  "version": "1.0.1",
+  "description": "Harness Agent 独立本地桌面应用",
+  "main": "main.cjs",
+  "private": true,
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "electron .",
+    "check": "node --check main.cjs && node --check preload.cjs && node --check splash.js"
+  }
+}

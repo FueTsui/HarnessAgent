@@ -1,5 +1,6 @@
 """持续覆盖架构审计中修复的安全回归。"""
 import json
+import re
 import tempfile
 import unittest
 import asyncio
@@ -235,6 +236,7 @@ class PersonalWeixinIsolationTests(unittest.TestCase):
 
 class OneTimeApprovalTests(unittest.TestCase):
     def setUp(self):
+        from backend import guardrail_policies, guardrails
         self.engine = create_engine(
             "sqlite://",
             connect_args={"check_same_thread": False},
@@ -242,6 +244,10 @@ class OneTimeApprovalTests(unittest.TestCase):
         )
         Base.metadata.create_all(self.engine)
         self.factory = sessionmaker(bind=self.engine)
+        for module in (guardrails, guardrail_policies):
+            patcher = patch.object(module, "SessionLocal", self.factory)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         db = self.factory()
         from backend.models import User
         db.add(User(id=7, username="approval-user", password_hash="x"))
@@ -388,6 +394,11 @@ class QueueConsistencyTests(unittest.TestCase):
         )
         Base.metadata.create_all(self.engine)
         self.factory = sessionmaker(bind=self.engine)
+        with self.factory.begin() as db:
+            db.add_all([
+                User(id=1, username="queue-owner-1", password_hash="x", is_active=True),
+                User(id=2, username="queue-owner-2", password_hash="x", is_active=True),
+            ])
         self.patch = patch.object(jobs, "SessionLocal", self.factory)
         self.patch.start()
 
@@ -1125,12 +1136,13 @@ class JwtRevocationTests(unittest.TestCase):
 
 class CookieAuthenticationTests(unittest.TestCase):
     def test_login_sets_httponly_cookie_and_cookie_authenticates(self):
+        from http.cookies import SimpleCookie
         from fastapi import Response
         from starlette.requests import Request
         from backend.api import auth as auth_api
         from backend.models import User
         from backend.schemas import LoginRequest
-        from backend.security import get_current_user, hash_password, resolve_access_token
+        from backend.security import get_current_user, hash_password, resolve_session_token
 
         engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(engine)
@@ -1154,7 +1166,7 @@ class CookieAuthenticationTests(unittest.TestCase):
             })
             response = Response()
             with patch.object(auth_api, "enforce"), patch.object(auth_api, "reset"):
-                token = auth_api.login(
+                identity = auth_api.login(
                     LoginRequest(username="cookie-user", password="secret-pass"),
                     request,
                     response,
@@ -1164,6 +1176,12 @@ class CookieAuthenticationTests(unittest.TestCase):
             self.assertIn("HttpOnly", cookie)
             self.assertIn("SameSite=strict", cookie)
             self.assertIn("Secure", cookie)
+            self.assertNotIn("Max-Age", cookie)
+            self.assertNotIn("expires=", cookie.lower())
+            self.assertNotIn("access_token", identity.model_dump())
+            parsed = SimpleCookie()
+            parsed.load(cookie)
+            token = parsed["gca_session"].value
             cookie_request = Request({
                 "type": "http",
                 "method": "GET",
@@ -1171,7 +1189,7 @@ class CookieAuthenticationTests(unittest.TestCase):
                 "path": "/api/v1/auth/me",
                 "headers": [(
                     b"cookie",
-                    f"gca_session={token.access_token}".encode(),
+                    f"gca_session={token}".encode(),
                 )],
                 "client": ("127.0.0.1", 1),
                 "server": ("test", 443),
@@ -1182,10 +1200,10 @@ class CookieAuthenticationTests(unittest.TestCase):
                 user.id,
             )
             logout_response = Response()
-            auth_api.logout(logout_response, user, db)
+            auth_api.logout(cookie_request, logout_response, db)
             self.assertIn("Max-Age=0", logout_response.headers["set-cookie"])
             with self.assertRaises(auth_api.HTTPException):
-                resolve_access_token(token.access_token, db)
+                resolve_session_token(token, db)
         finally:
             db.close()
             engine.dispose()
@@ -1197,7 +1215,13 @@ class CookieAuthenticationTests(unittest.TestCase):
             for path in root.rglob("*")
             if path.suffix in {".html", ".js"}
         )
-        self.assertNotIn("gca_token", text_value)
+        # Upgrading clients may remove the legacy credential, but must never
+        # read or write it again. Keep every other reference disallowed.
+        without_legacy_cleanup = re.sub(
+            r"(?:localStorage|sessionStorage)\s*\.\s*removeItem\s*\(\s*(['\"])gca_token\1\s*\)",
+            "", text_value,
+        )
+        self.assertNotIn("gca_token", without_legacy_cleanup)
         self.assertNotIn("onclick=", text_value)
         self.assertNotIn("<script>", text_value)
 

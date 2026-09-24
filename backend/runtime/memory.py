@@ -10,6 +10,7 @@ import re
 from sqlalchemy.orm import Session
 
 from ..models import Thread, Turn, iso_utc
+from ..memory_store import explicit_candidates, SCOPE_LABELS
 from .task_store import thread_messages
 
 DEFAULT_HISTORY_LIMIT = 50
@@ -19,6 +20,11 @@ DEFAULT_MIN_RELEVANCE = .12
 DEFAULT_INFLUENCE = .35
 DEFAULT_MAX_CHARS = 1800
 _MAX_SNIPPET = 600
+
+
+def load_explicit_history(db: Session, user_id, *, session_id: str = "", agent_id: int | None = None) -> list[dict]:
+    """Load current account's persisted custom/context/project/global candidates."""
+    return explicit_candidates(db, user_id, session_id=session_id, agent_id=agent_id)
 
 
 def _tokens(text: str) -> set[str]:
@@ -134,6 +140,9 @@ def select_recall(
         score = relevance_weight * relevance + recency_weight * _age_score(
             item.get("created_at")
         )
+        if item.get("source_type") == "explicit":
+            # User-saved facts remain background evidence, not elevated instructions.
+            score *= min(.75, max(0.0, float(item.get("weight_multiplier", .75))))
         if relevance >= min_relevance:
             scored.append((score, relevance, item))
     scored.sort(
@@ -149,8 +158,9 @@ def select_recall(
     for score, relevance, item in selected:
         created = item.get("created_at")
         when = created.strftime("%Y-%m-%d") if hasattr(created, "strftime") else ""
+        label = SCOPE_LABELS.get(item.get("scope"), "历史会话") if item.get("source_type") == "explicit" else "历史会话"
         blocks.append(
-            f"[历史会话{f'·{when}' if when else ''}；"
+            f"[{label}{f'·{when}' if when else ''}；"
             f"有效权重={score * influence:.2f}；相关度={relevance:.2f}]\n"
             f"问：{str(item.get('query') or '')[:_MAX_SNIPPET]}\n"
             f"答：{str(item.get('answer') or '')[:_MAX_SNIPPET]}"
@@ -164,6 +174,10 @@ def select_recall(
             "score": round(score, 4),
             "relevance": round(relevance, 4),
             "effective_weight": round(score * influence, 4),
+            "source_type": item.get("source_type", "conversation"),
+            "memory_id": item.get("memory_id"),
+            "scope": item.get("scope", "history"),
+            "source": str(item.get("source") or "历史会话")[:300],
         })
     content = "\n\n".join(blocks)
     if content:

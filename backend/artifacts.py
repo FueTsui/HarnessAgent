@@ -281,6 +281,24 @@ def register_many(
     return rows
 
 
+def register_generated(*, owner_id: int, run_id: str, filename: str) -> None:
+    """Persist an intermediate output independently of final-answer verification."""
+    from .models import Job, Turn
+
+    with SessionLocal() as db:
+        job = db.get(Job, run_id)
+        turn = db.get(Turn, run_id)
+        if job is None or turn is None or job.owner_id != owner_id or turn.owner_id != owner_id:
+            raise ValueError("产物登记缺少有效的运行归属")
+        rows = register_many(
+            db, owner_id=owner_id, run_id=run_id, turn_id=run_id,
+            filenames=[filename],
+        )
+        if not rows:
+            raise ValueError("产物登记失败：生成文件不存在")
+        db.commit()
+
+
 def delete_for_owner(db, owner_id: int) -> list[str]:
     """在当前事务中删除账号的产物元数据，并返回待清理的文件名。
 

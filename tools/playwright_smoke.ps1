@@ -2,12 +2,13 @@ param(
   [int]$Port = 8765,
   [string]$Python = "python",
   [string]$RootPassword = "Browser-Smoke-Root-2026!",
-  [string]$PlaywrightCliPackage = "@playwright/cli@0.1.18"
+  [string]$PlaywrightCliPackage = "@playwright/cli@0.1.18",
+  [string]$EvidenceName = "windows-smoke"
 )
 
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$artifactRoot = Join-Path $repoRoot "output\playwright\windows-smoke"
+$artifactRoot = Join-Path (Join-Path $repoRoot "output\playwright") $EvidenceName
 $tempBase = Join-Path $repoRoot "tmp"
 $dataDir = Join-Path $tempBase ("browser-smoke-" + [guid]::NewGuid().ToString("N"))
 $session = "agent-smoke-" + [guid]::NewGuid().ToString("N").Substring(0, 10)
@@ -34,6 +35,7 @@ try {
   $env:APP_HOST = "127.0.0.1"
   $env:APP_PORT = [string]$Port
   $env:APP_DATA_DIR = $dataDir
+  $env:DATABASE_URL = "sqlite:///" + (Join-Path $dataDir "app.db").Replace('\', '/')
   $env:JWT_SECRET = "browser-smoke-jwt-secret-with-at-least-32-bytes"
   $env:SECRET_MASTER_KEY = "browser-smoke-envelope-key-with-at-least-32-bytes"
   $env:ROOT_PASSWORD = $RootPassword
@@ -53,6 +55,7 @@ try {
     Start-Sleep -Milliseconds 500
   }
   if (-not $healthy) { throw "Service did not become healthy at $baseUrl" }
+  $health | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 (Join-Path $artifactRoot "00-health.json")
 
   & npx --yes --package $PlaywrightCliPackage playwright-cli install-browser chromium | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "Chromium installation failed" }
@@ -61,8 +64,8 @@ try {
     Invoke-Pw @("open", "$baseUrl/login") | Out-Null
     $loginSnapshot = Invoke-Pw @("snapshot")
     $loginSnapshot | Set-Content -Encoding UTF8 "01-login-snapshot.txt"
-    $usernameRef = Find-Ref $loginSnapshot "textbox" "请输入用户名"
-    $passwordRef = Find-Ref $loginSnapshot "textbox" "请输入密码"
+    $usernameRef = Find-Ref $loginSnapshot "textbox" "用户名"
+    $passwordRef = Find-Ref $loginSnapshot "textbox" "密码"
     $loginRef = Find-Ref $loginSnapshot "button" "登录工作台"
     Invoke-Pw @("fill", $usernameRef, "root") | Out-Null
     Invoke-Pw @("fill", $passwordRef, $RootPassword) | Out-Null
@@ -71,11 +74,17 @@ try {
     $chatSnapshot = Invoke-Pw @("snapshot")
     $chatSnapshot | Set-Content -Encoding UTF8 "02-chat-snapshot.txt"
     if ($chatSnapshot -notmatch "今天想完成什么|新对话") { throw "Chat workspace did not render after login" }
+    $recoveryCheck = Invoke-Pw @("eval", "() => { const restored = runtimeEventPresentation('recovery.resumed', {checkpoint_revision: 3, iteration: 2}); const blocked = runtimeEventPresentation('recovery.blocked', {tool: 'write', reason: 'unknown_outcome'}); if (!restored.text.includes('恢复') || !blocked.text.includes('需') || blocked.kind !== 'warning') throw new Error('Recovery presentation mismatch'); return 'runtime-recovery-ui-ok'; }")
+    $recoveryCheck | Set-Content -Encoding UTF8 "02-recovery-presentation.txt"
+    if ($recoveryCheck -notmatch "runtime-recovery-ui-ok") { throw "Recovery UI check did not complete" }
 
     Invoke-Pw @("eval", "location.href='/admin'") | Out-Null
     Start-Sleep -Milliseconds 800
     $adminSnapshot = Invoke-Pw @("snapshot")
     $adminSnapshot | Set-Content -Encoding UTF8 "03-admin-snapshot.txt"
+    $optimizeRef = Find-Ref $adminSnapshot "button" "优化"
+    Invoke-Pw @("click", $optimizeRef) | Out-Null
+    $adminSnapshot = Invoke-Pw @("snapshot")
     $operationsRef = Find-Ref $adminSnapshot "button" "运行中心"
     Invoke-Pw @("click", $operationsRef) | Out-Null
     Start-Sleep -Milliseconds 800

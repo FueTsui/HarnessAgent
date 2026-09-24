@@ -8,30 +8,43 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import asdict, fields
 
 from ..config import settings
+from .. import guardrails
+from ..guardrail_policies import guard_model_client, enforce_content
 from ..approvals import ApprovalRequired, consume as consume_approval
 from ..approval_policy import (
     normalize as normalize_approval_policy,
-    requires_external_approval,
 )
+from ..model_roles import normalize_execution_options, parse_tool_selection, tool_selection_request
 from ..llm import mcp_client
 from . import builtin_tools
 from .control import (
     FALSE_WEB_DENIAL_ISSUE,
+    Observation,
     analyze_observation,
     canonical_tool_name,
     compact_tool_observations,
     evidence_capability_name,
     preflight_arguments,
     repair_arguments,
+    repair_tool_call,
     required_evidence_tools,
+    requires_presentation_artifact,
+    resolve_task_objective,
     route_tools,
     verify_answer,
 )
 from .evaluation import evaluate_execution, select_evaluation_skills
 from .loop import AGENT_LOOP_VERSION, AgentLoopState
 from .policies import RuntimePolicies
+from .skill_resources import SkillResourceIndex
+from .tool_contracts import McpToolBinding, ToolCatalog, unavailable_tool_result
+from .task_contract import TaskContract
+from .scheduler import ScheduledCall, run_ordered_batch
+from .durability import execution_store, UnknownToolOutcome
+from .execution import context_snapshot, restore_context, invoke_journaled, InvocationPersistenceError
 
 logger = logging.getLogger(__name__)
 
@@ -192,28 +205,7 @@ async def _compact_history(
 
 
 def _skill_prompt(skills: list[dict]) -> str:
-    blocks = []
-    for skill in skills or []:
-        text = f"### 技能：{skill.get('name', '')}"
-        if skill.get("description"):
-            text += f"\n适用场景：{skill['description']}"
-        text += f"\n{skill.get('instructions', '')}"
-        resources = skill.get("resources") or []
-        if resources:
-            readable = [
-                str(item.get("name", "")) for item in resources
-                if "content" in item and not item.get("binary")
-            ]
-            assets = [
-                str(item.get("name", "")) for item in resources
-                if item.get("binary") or "content" not in item
-            ]
-            if readable:
-                text += "\n可按需读取文本资源：" + "、".join(readable)
-            if assets:
-                text += "\n随 Skill 安装的二进制资产（由系统能力使用）：" + "、".join(assets)
-        blocks.append(text)
-    return "\n\n".join(blocks)
+    return SkillResourceIndex(skills).descriptor_prompt()
 
 
 def _tool_name(prefix: str, name: str, used: set[str]) -> str:
@@ -242,6 +234,10 @@ async def _run_descriptor(
         parent_run_id = str(
             builtin_context.execution_id or builtin_context.run_id or ""
         )
+        if parent_run_id and delegation_call_id:
+            child_run_id = uuid.uuid5(
+                uuid.NAMESPACE_URL, f"{parent_run_id}/{delegation_call_id}/{child_agent_id}"
+            ).hex
         parent_agent_id = builtin_context.agent_id
         depth = builtin_context.subagent_depth + 1
         parent_event = builtin_context.runtime_event
@@ -264,6 +260,8 @@ async def _run_descriptor(
                 await value
 
         child_context = builtin_tools.BuiltinToolContext(
+            artifact_callback=builtin_context.artifact_callback,
+            presentation_requirements=builtin_context.presentation_requirements,
             root=builtin_context.root,
             user_id=builtin_context.user_id,
             agent_id=child_agent_id,
@@ -313,6 +311,8 @@ async def _run_descriptor(
             skills=descriptor.get("skills"),
             mcp_servers=descriptor.get("mcp_servers"),
             sub_agents=descriptor.get("sub_agents"),
+            model_execution=descriptor.get("model_execution"),
+            role_clients=descriptor.get("role_clients"),
             tool_policy=descriptor.get("tool_policy"),
             memory_policy=descriptor.get("memory_policy"),
             verification_policy=descriptor.get("verification_policy"),
@@ -348,6 +348,8 @@ async def run_harness(
     skills=None,
     mcp_servers=None,
     sub_agents=None,
+    model_execution=None,
+    role_clients=None,
     memory="",
     progress=None,
     skill_builder=None,
@@ -357,6 +359,7 @@ async def run_harness(
     attachment_text="",
     template_context="",
     invocation_context="",
+    preferred_mcp_ids=None,
     tool_policy=None,
     memory_policy=None,
     verification_policy=None,
@@ -367,6 +370,7 @@ async def run_harness(
     interaction_context=None,
     builtin_context: builtin_tools.BuiltinToolContext | None = None,
     completion_metadata: dict | None = None,
+    checkpoint_store=None,
 ) -> tuple[str, str]:
     """运行动态 Agent Loop，返回（最终答复, 保留的兼容空字段）。
 
@@ -374,6 +378,26 @@ async def run_harness(
     """
     if llm is None:
         raise RuntimeError("未配置可用模型")
+    query = resolve_task_objective(query, history)
+    llm = guard_model_client(
+        llm,
+        user_id=getattr(builtin_context, "user_id", None),
+        agent_id=getattr(builtin_context, "agent_id", None),
+        runtime_event=runtime_event,
+    )
+    execution_options = normalize_execution_options(model_execution or {})
+    stage_clients = {
+        name: guard_model_client(
+            client,
+            user_id=getattr(builtin_context, "user_id", None),
+            agent_id=getattr(builtin_context, "agent_id", None),
+            runtime_event=runtime_event,
+        )
+        for name, client in (role_clients or {}).items()
+        if name in {"planner", "router", "critic"} and client is not None
+    }
+    if builtin_context is not None:
+        builtin_context.llm = llm
     policies = RuntimePolicies.from_dicts(
         tool_policy, memory_policy, verification_policy, output_policy
     )
@@ -403,6 +427,24 @@ async def run_harness(
                     f"关键运行事件写入失败：{event_type}"
                 ) from exc
 
+    async def stage_call(role: str, messages, tools=None):
+        client = stage_clients.get(role, llm)
+        await emit("model.role.selected", {
+            "role": role, "provider_id": getattr(client, "provider_id", None),
+            "inherited": client is llm,
+        })
+        try:
+            return await client.chat_with_tools(messages, tools=tools)
+        except Exception as exc:
+            if client is llm or isinstance(exc, ApprovalRequired) or getattr(exc, "code", "") == "guardrail_content_blocked":
+                raise
+            await emit("model.role.fallback", {
+                "role": role, "provider_id": getattr(llm, "provider_id", None),
+                "inherited": True, "reason": "role_unavailable",
+            })
+            # Only transport/model errors may inherit the authorized executor.
+            return await llm.chat_with_tools(messages, tools=tools)
+
     system = f"{_current_time_note()}\n\n{system_prompt or '你是一个可靠的通用智能体。'}"
     system += (
         "\n\n[运行规则]\n每轮只决定当前最有价值的下一步；只调用明确绑定且语义匹配的工具；"
@@ -420,6 +462,8 @@ async def run_harness(
         "blocked 只用于缺少权限、凭据、关键选择或必要数据而无法形成可接受结论。"
         "给出最终答复前，应把实际完成的步骤标记为 completed，并保留未完成步骤的真实状态。"
     )
+    if execution_options["planning"]["mode"] == "off":
+        system += "\n管理员已关闭任务计划控制；本轮直接执行任务，不创建或调用 update_plan。"
     interaction_context = (
         dict(interaction_context) if isinstance(interaction_context, dict) else {}
     )
@@ -456,6 +500,13 @@ async def run_harness(
             "不能用重新生成正文冒充文件编辑；需要把图片识别结果或新正文制作成 Word 时，"
             "必须使用 document_create 生成真实可下载的 DOCX，不能只在答复中粘贴文字；"
             "工具不可用或失败时应准确说明具体原因。"
+        )
+        system += "\n附件块中已包含解析出的 PDF 等文档正文，可直接使用，不需要另找 PDF 读取工具。"
+    if builtin_context and "presentation_create" in (builtin_context.enabled_tools or set()):
+        system += (
+            "\n[PPT 执行能力]\n可用 presentation_create 将逐页标题和正文生成可下载、"
+            "原生文字可编辑的 PPTX。无需文件或 Shell 工具。技能中的本地脚本流程仅在"
+            "相应工具实际可用时执行；否则使用此受控能力并准确说明版式与图片还原限制。"
         )
     if template_context:
         untrusted_context["template"] = str(template_context)
@@ -525,26 +576,29 @@ async def run_harness(
         ],
     })
 
-    resource_index = {
-        (skill.get("name"), item.get("name")): item.get("content", "")
-        for skill in (skills or [])
-        for item in (skill.get("resources") or [])
-        if "content" in item and not item.get("binary")
-    }
+    resource_index = SkillResourceIndex(skills)
     used = {READ_SKILL_RESOURCE, CREATE_SKILL, UPDATE_PLAN}
     enable_builtin_tools = builtin_context is not None
     builtin_context = builtin_context or builtin_tools.BuiltinToolContext(
         llm=llm, sub_agents=sub_agents or [], runtime_event=runtime_event
     )
-    builtin_names = set()
-    tools: list[dict] = []
-    routes: dict[str, tuple] = {}
-    agent_routes: dict[str, dict] = {}
+    journal = checkpoint_store if checkpoint_store is not None else execution_store(
+        builtin_context.run_id, builtin_context.user_id,
+        execution_key=builtin_context.execution_id or builtin_context.run_id or "root",
+    )
+    saved_checkpoint = journal.load_checkpoint() if journal is not None else None
+    checkpoint_revision = saved_checkpoint["revision"] if saved_checkpoint else 0
+    restored_state = saved_checkpoint["state"] if saved_checkpoint else {}
+    task_contract = TaskContract.from_snapshot(
+        restored_state.get("task_contract", {}), fallback_objective=query or ""
+    )
+    query = task_contract.objective
+    catalog = ToolCatalog()
 
     # 与 Codex 的 update_plan 相同：这是用户可见任务清单的控制能力，不代表业务工具。
     # 旧测试桩可能只实现纯文本 chat，因此仅在客户端支持工具协议时开放。
-    if hasattr(llm, "chat_with_tools"):
-        tools.append({
+    if hasattr(llm, "chat_with_tools") and execution_options["planning"]["mode"] != "off":
+        catalog.register({
             "type": "function",
             "function": {
                 "name": UPDATE_PLAN,
@@ -592,7 +646,7 @@ async def run_harness(
                     "required": ["plan"],
                 },
             },
-        })
+        }, "control")
 
     for spec in builtin_tools.tool_specs(
         enabled_names=builtin_context.enabled_tools
@@ -601,24 +655,35 @@ async def run_harness(
         if not name or name in used:
             continue
         used.add(name)
-        builtin_names.add(name)
-        tools.append(spec)
+        catalog.register(spec, "builtin")
 
     if resource_index:
-        tools.append({
+        catalog.register({
             "type": "function",
             "function": {
                 "name": READ_SKILL_RESOURCE,
-                "description": "按需读取某个 Skill 附带的文本资源。",
+                "description": (
+                    "按需读取本次已授权 Skill 的文本资源。使用技能前先读取 SKILL.md 入口；"
+                    "其他资源名见技能说明。找不到资源时按返回的可读资源目录修正，不要重复失败请求。"
+                ),
                 "parameters": {
                     "type": "object",
-                    "properties": {"skill": {"type": "string"}, "file": {"type": "string"}},
+                    "properties": {
+                        "skill": {
+                            "type": "string",
+                            "description": "已授权技能的准确名称：" + "、".join(resource_index.skill_names),
+                        },
+                        "file": {
+                            "type": "string",
+                            "description": "技能入口用 SKILL.md；其他文本资源用所列安全相对路径。不能读取二进制资产。",
+                        },
+                    },
                     "required": ["skill", "file"],
                 },
             },
-        })
+        }, "resource")
     if skill_builder:
-        tools.append({
+        catalog.register({
             "type": "function",
             "function": {
                 "name": CREATE_SKILL,
@@ -634,11 +699,10 @@ async def run_harness(
                     "required": ["name", "description", "instructions"],
                 },
             },
-        })
+        }, "skill")
     for descriptor in sub_agents or []:
         name = _tool_name("call_agent__", descriptor.get("name", ""), used)
-        agent_routes[name] = descriptor
-        tools.append({
+        catalog.register({
             "type": "function",
             "function": {
                 "name": name,
@@ -649,13 +713,17 @@ async def run_harness(
                     "required": ["query"],
                 },
             },
-        })
+        }, "agent", descriptor)
 
+    preferred_mcp_ids = set(preferred_mcp_ids or [])
+    mcp_availability = []
     async with contextlib.AsyncExitStack() as stack:
         for server in mcp_servers or []:
             try:
                 connection = await stack.enter_async_context(mcp_client.McpConnection(server))
                 remote_tools = await connection.list_tools()
+                mcp_availability.append({"server_id": server.id, "name": server.name, "status": "connected",
+                                         "discovered_count": len(remote_tools)})
                 for spec in mcp_client.build_tool_specs(
                     server.name,
                     remote_tools,
@@ -672,43 +740,49 @@ async def run_harness(
                         spec["function"]["name"] = alias
                         used.add(alias)
                     name = spec["function"]["name"]
-                    routes[name] = (
-                        connection,
-                        remote_name,
-                        dict(spec.get("_risk") or {}),
-                        dict(spec.get("_input_schema") or {}),
-                        int(getattr(server, "id", 0) or 0),
-                        str(getattr(server, "name", "MCP") or "MCP"),
+                    binding = McpToolBinding(
+                        connection=connection,
+                        remote_name=remote_name,
+                        risk=dict(spec.get("_risk") or {}),
+                        input_schema=dict(spec.get("_input_schema") or {}),
+                        server_id=int(getattr(server, "id", 0) or 0),
+                        server_name=str(getattr(server, "name", "MCP") or "MCP"),
+                        output_schema=spec.get("_output_schema"),
                     )
-                    tools.append({"type": "function", "function": spec["function"]})
+                    catalog.register(
+                        {"type": "function", "function": spec["function"]}, "mcp", binding
+                    )
             except Exception as exc:
+                mcp_availability.append({"server_id": server.id, "name": server.name,
+                                         "status": "connection_failed"})
                 logger.warning("MCP 服务「%s」不可用：%s", getattr(server, "name", "?"), exc)
 
         # 纯文本任务维持原有直答路径；存在其他执行能力时才开放计划控制，
         # 避免为了展示计划而改变简单问答的模型调用协议和结果语义。
-        if len(tools) == 1 and not _needs_task_plan(query or "") and (
-            (tools[0].get("function") or {}).get("name") == UPDATE_PLAN
-        ):
-            tools = []
+        if (catalog.names == {UPDATE_PLAN} and not _needs_task_plan(query or "")
+                and execution_options["planning"]["mode"] != "always"):
+            catalog = ToolCatalog()
 
-        if policies.tool_mode == "disabled":
-            tools = [
-                item for item in tools
-                if (item.get("function") or {}).get("name") == UPDATE_PLAN
-            ]
-        else:
-            allowed = set(policies.allowed_tools)
-            denied = set(policies.denied_tools)
-            tools = [
-                item for item in tools
-                if (item.get("function") or {}).get("name") not in denied
-                and (
-                    (item.get("function") or {}).get("name") == UPDATE_PLAN
-                    or
-                    policies.tool_mode != "allowlist"
-                    or (item.get("function") or {}).get("name") in allowed
-                )
-            ]
+        catalog = catalog.select(policies)
+        tools = catalog.definitions
+        preferred_names = {
+            name for name in catalog.names
+            if catalog.is_kind(name, "mcp")
+            and catalog.require(name).binding.server_id in preferred_mcp_ids
+        }
+        for state in mcp_availability:
+            state["available_count"] = sum(
+                catalog.is_kind(name, "mcp")
+                and catalog.require(name).binding.server_id == state["server_id"]
+                for name in catalog.names
+            )
+            state["selected"] = state["server_id"] in preferred_mcp_ids
+        # Connection facts are distinct from per-iteration model visibility.
+        # Exclude URLs, credentials and exception text from model context.
+        availability_message = ("\n\n[MCP 能力状态 JSON]\n" + json.dumps(mcp_availability)
+                   + "\n工具列表是本轮候选子集；未出现在候选中不等于未绑定或连接失败。"
+                   "仅依据上面的状态说明能力可用性；未调用不能表述为调用失败。")
+        system += availability_message
         await emit("tools.catalogued", {
             "count": len(tools),
             "mode": policies.tool_mode,
@@ -764,6 +838,7 @@ async def run_harness(
 
         async def apply_guidance() -> int:
             """在模型调用边界吸收运行中追加的用户引导。"""
+            nonlocal query, evidence_tools, requires_initial_plan, successful_tools
             if not guidance:
                 return 0
             try:
@@ -783,6 +858,32 @@ async def run_harness(
                 mode = str(
                     (row.get("mode") or "guide") if isinstance(row, dict) else "guide"
                 ).strip().lower() or "guide"
+                guidance_id = str(row.get("id") or "") if isinstance(row, dict) else ""
+                if not task_contract.apply_guidance(content, mode=mode, guidance_id=guidance_id):
+                    if guidance_id:
+                        await emit("guidance.applied", {"guidance_id": guidance_id, **(
+                            {"mode": mode} if mode != "guide" else {}
+                        )})
+                    continue
+                query = task_contract.objective
+                # Previous evidence remains in the transcript but cannot prove a
+                # revised objective. Budgets and write deduplication remain intact.
+                successful_tools = 0
+                successful_tool_names.clear()
+                loop.successful_tools = 0
+                loop.successful_tool_names.clear()
+                for signature in list(cache):
+                    entry = catalog.get(signature.split("|", 1)[0])
+                    if entry and entry.read_only:
+                        cache.pop(signature, None)
+                if mode == "redirect":
+                    active_plan.clear()
+                    builtin_context.plan_steps = []
+                evidence_tools = required_evidence_tools(query, available_tool_names)
+                loop.required_evidence_tools = evidence_tools
+                requires_initial_plan = bool(plan_tool and (
+                    execution_options["planning"]["mode"] == "always" or _needs_task_plan(query)
+                ))
                 messages.append({
                     "role": "user",
                     "content": (
@@ -791,18 +892,21 @@ async def run_harness(
                         "[用户在任务执行期间重定向当前目标]\n" + content
                     ),
                 })
-                guidance_id = str(row.get("id") or "") if isinstance(row, dict) else ""
-                if guidance_id:
-                    applied_payload = {"guidance_id": guidance_id}
-                    if mode != "guide":
-                        applied_payload["mode"] = mode
-                    await emit("guidance.applied", applied_payload)
                 applied_interactions.append({
                     "id": guidance_id or f"guidance_{len(applied_interactions) + 1}",
                     "mode": mode,
                     "applied": True,
                 })
                 added += 1
+                # The event callback acknowledges JobGuidance. Commit its private
+                # executable meaning first so a crash cannot lose acknowledged intent.
+                save_runtime("ready", max(0, loop.iteration - 1))
+                await emit("task.contract.updated", {"revision": task_contract.revision, "mode": mode})
+                if guidance_id:
+                    applied_payload = {"guidance_id": guidance_id}
+                    if mode != "guide":
+                        applied_payload["mode"] = mode
+                    await emit("guidance.applied", applied_payload)
             return added
         # ``successful_tools`` 是完成门禁使用的全部成功证据；
         # ``budgeted_successful_tools`` 只统计模型在普通循环中选择的业务工具。
@@ -824,15 +928,13 @@ async def run_harness(
             return set(evidence_tools) - used
 
         # ``update_plan`` 与 Codex 一样是用户可见的控制面能力。状态保存在本轮
-        # 闭包中，既用于给步骤分配稳定 id，也用于在最终验证通过后收束计划。
+        # 私有检查点中，既用于给步骤分配稳定 id，也用于在最终验证通过后收束计划。
         active_plan: list[dict] = []
         plan_sequence = 0
         plan_revision = 0
         execution_announced = False
         finalizing_announced = False
-        available_tool_names = {
-            str((item.get("function") or {}).get("name") or "") for item in tools
-        }
+        available_tool_names = catalog.names
         plan_tool = next(
             (
                 item for item in tools
@@ -896,6 +998,11 @@ async def run_harness(
             finalizing_announced = True
 
         async def apply_plan_update(args: dict) -> str:
+            await enforce_content(
+                "tool_input", args, user_id=builtin_context.user_id,
+                agent_id=builtin_context.agent_id,
+                provider_id=getattr(llm, "provider_id", None), runtime_event=runtime_event,
+            )
             """校验并应用计划控制调用；普通循环与预算收尾共用同一实现。"""
             nonlocal plan_revision, plan_sequence
             plan_steps = []
@@ -1022,19 +1129,28 @@ async def run_harness(
                     + json.dumps(active_plan, ensure_ascii=False)
                 ),
             })
-            response = await llm.chat_with_tools(messages, tools=[plan_tool])
+            response = await stage_call("planner", messages, tools=[plan_tool])
             loop.model_calls += 1
             messages.append(response)
             calls = response.get("tool_calls") or []
             applied = False
             for index, call in enumerate(calls):
-                function = call.get("function") or {}
+                raw_function = call.get("function")
+                function = raw_function if isinstance(raw_function, dict) else {}
+                call["function"] = function
                 call_id = call.get("id") or f"plan_closeout_{index}"
-                name = canonical_tool_name(
-                    function.get("name", ""), {UPDATE_PLAN}
-                )
+                normalized = repair_tool_call(raw_function, {UPDATE_PLAN})
+                name = normalized.name
+                if normalized.repaired:
+                    function["name"] = name
+                    function["arguments"] = (
+                        json.dumps(normalized.arguments, ensure_ascii=False)
+                        if isinstance(normalized.arguments, dict) else normalized.arguments
+                    )
                 if index > 0:
                     result = "计划收尾只执行首个 update_plan 调用"
+                elif normalized.error:
+                    result = normalized.error
                 elif name != UPDATE_PLAN:
                     result = "计划收尾阶段只允许调用 update_plan"
                 else:
@@ -1093,31 +1209,53 @@ async def run_harness(
 
         def prepare_mcp_call(tool_name: str, arguments: dict) -> tuple[dict, dict]:
             """统一生成 MCP 风险、审批范围、目标预览与可选幂等键。"""
-            (
-                _connection,
-                remote_name,
-                risk,
-                input_schema,
-                server_id,
-                server_name,
-            ) = routes[tool_name]
-            scope = f"mcp:{server_id}:{remote_name}"
+            binding: McpToolBinding = catalog.require(tool_name).binding
+            scope = f"mcp:{binding.server_id}:{binding.remote_name}"
             prepared, idempotency_field = mcp_client.inject_idempotency_key(
                 arguments,
-                input_schema,
+                binding.input_schema,
                 seed=f"{builtin_context.run_id or ''}:{scope}",
             )
             return prepared, {
-                **risk,
+                **binding.risk,
                 "scope": scope,
-                "server": server_name,
-                "remote_tool": remote_name,
+                "server": binding.server_name,
+                "remote_tool": binding.remote_name,
                 "idempotency_field": idempotency_field,
                 "preview": mcp_client.safe_argument_preview(prepared),
             }
 
-        async def execute_mcp_call(tool_name: str, arguments: dict, metadata: dict) -> str:
-            connection, remote_name, _risk, _schema, _server_id, server_name = routes[tool_name]
+        async def execute_mcp_call(tool_name: str, arguments: dict, metadata: dict):
+            binding: McpToolBinding = catalog.require(tool_name).binding
+            connection, remote_name = binding.connection, binding.remote_name
+            server_name = binding.server_name
+            await enforce_content(
+                "tool_input", arguments, user_id=builtin_context.user_id,
+                agent_id=builtin_context.agent_id,
+                provider_id=getattr(llm, "provider_id", None), runtime_event=runtime_event,
+            )
+            decision = await asyncio.to_thread(
+                guardrails.runtime_decision,
+                kind="mcp", tool_name=remote_name, arguments=arguments,
+                policy=builtin_context.approval_policy,
+                mutating=bool(metadata.get("mutating")),
+                destructive=bool(metadata.get("destructive")),
+                server_id=binding.server_id,
+            )
+            if decision["decision"] == "block" or decision["guardrail_requires_approval"]:
+                await emit("guardrail.evaluated", guardrails.event_payload(
+                    decision, agent_id=builtin_context.agent_id,
+                    execution_id=builtin_context.execution_id or builtin_context.run_id,
+                ))
+            from ..guardrail_reviews import review_tool
+            decision = await review_tool(decision, builtin_context.user_id, builtin_context.agent_id, runtime_event)
+            if decision["decision"] == "block":
+                raise builtin_tools.ToolError(decision["reason"], code="guardrail_blocked")
+            if decision["guardrail_requires_approval"] and not builtin_context.run_id:
+                raise builtin_tools.ToolError(
+                    "护栏要求单次审批，当前调用缺少可审批任务上下文",
+                    code="guardrail_approval_context_required",
+                )
             if metadata.get("mutating") and builtin_context.run_id:
                 selected_policy = normalize_approval_policy(
                     builtin_context.approval_policy
@@ -1133,11 +1271,7 @@ async def run_harness(
                     f"MCP 外部写操作：{server_name}/{remote_name}；"
                     f"风险={metadata.get('risk', 'write')}；目标={metadata.get('preview') or '{}'}"
                 )
-                if not approved_once and requires_external_approval(
-                    selected_policy,
-                    mutating=True,
-                    destructive=bool(metadata.get("destructive")),
-                ):
+                if not approved_once and decision["requires_approval"]:
                     raise ApprovalRequired(
                         str(metadata["scope"]),
                         description,
@@ -1166,7 +1300,106 @@ async def run_harness(
                         "parent_run_id": builtin_context.parent_run_id,
                         "subagent_depth": builtin_context.subagent_depth,
                     })
-            return await connection.call_tool(remote_name, arguments)
+            # 新连接保留 MCP 结构；旧连接适配器仍可返回文本。
+            caller = getattr(connection, "call_tool_result", connection.call_tool)
+            result = await caller(remote_name, arguments)
+            await enforce_content(
+                "tool_output", result, user_id=builtin_context.user_id,
+                agent_id=builtin_context.agent_id,
+                provider_id=getattr(llm, "provider_id", None), runtime_event=runtime_event,
+            )
+            return result
+
+        async def dispatch_tool(contract, args, call_id, metadata=None):
+            async def action():
+                if contract.kind == "control":
+                    return await apply_plan_update(args)
+                if contract.name == READ_SKILL_RESOURCE:
+                    result = resource_index.read(args.get("skill"), args.get("file"))
+                    value = json.loads(result)
+                    if value.get("ok") and value.get("file") == "SKILL.md":
+                        builtin_context.active_skill_names.add(value["skill"])
+                        await emit("capability.activated", {"kind": "skill", "name": value["skill"]})
+                    return result
+                if contract.name == CREATE_SKILL and skill_builder:
+                    return await skill_builder(args)
+                if contract.kind == "agent":
+                    return await _run_descriptor(contract.binding, args.get("query") or query,
+                                                 progress, builtin_context, call_id)
+                if contract.kind == "builtin":
+                    return await builtin_tools.execute(contract.name, args, builtin_context)
+                if contract.kind == "mcp":
+                    return await execute_mcp_call(contract.name, args, metadata or {})
+                raise ValueError(f"未知工具：{contract.name}")
+
+            return await invoke_journaled(
+                journal, contract, call_id, args,
+                lambda: asyncio.wait_for(action(), timeout=policies.tool_timeout_seconds),
+                context=builtin_context, max_output_chars=policies.max_tool_output_chars, emit=emit,
+            )
+
+        cache: dict[str, Observation] = {}
+        signature_counts: dict[str, int] = {}
+        recent_observations: list[str] = []
+        repetition_recovery_used = False
+        repair_attempts = 0
+        requires_initial_plan = bool(plan_tool and (
+            execution_options["planning"]["mode"] == "always" or _needs_task_plan(query or "")
+        ))
+        pending_message = None
+        resume_iteration = 0
+
+        def save_runtime(phase, next_iteration, pending=None, answer=None):
+            nonlocal checkpoint_revision
+            if journal is None:
+                return
+            checkpoint_revision = journal.save_checkpoint({
+                "version": 1, "phase": phase, "next_iteration": next_iteration,
+                "pending_message": pending, "messages": messages,
+                "task_contract": task_contract.snapshot(), "loop": loop.checkpoint(),
+                "active_plan": active_plan, "plan_sequence": plan_sequence,
+                "plan_revision": plan_revision, "successful_tools": successful_tools,
+                "budgeted_successful_tools": budgeted_successful_tools,
+                "successful_tool_names": sorted(successful_tool_names),
+                "cache": {key: asdict(value) for key, value in cache.items()},
+                "signature_counts": signature_counts, "recent_observations": recent_observations,
+                "repetition_recovery_used": repetition_recovery_used,
+                "repair_attempts": repair_attempts, "applied_interactions": applied_interactions,
+                "context": context_snapshot(builtin_context), "answer": answer,
+                "completion_metadata": completion_metadata,
+            }, expected_revision=checkpoint_revision)
+
+        if restored_state:
+            if restored_state.get("version") != 1:
+                raise ValueError("运行检查点版本不受支持")
+            messages[:] = restored_state["messages"]
+            messages.append({"role": "system", "content": availability_message})
+            active_plan[:] = restored_state.get("active_plan", [])
+            plan_sequence = restored_state.get("plan_sequence", 0)
+            plan_revision = restored_state.get("plan_revision", 0)
+            builtin_context.plan_steps = [dict(item) for item in active_plan]
+            builtin_context.plan_revision = plan_revision
+            successful_tools = restored_state.get("successful_tools", 0)
+            budgeted_successful_tools = restored_state.get("budgeted_successful_tools", 0)
+            successful_tool_names.update(restored_state.get("successful_tool_names", []))
+            cache.update({key: Observation(**value) for key, value in restored_state.get("cache", {}).items()})
+            signature_counts.update(restored_state.get("signature_counts", {}))
+            recent_observations[:] = restored_state.get("recent_observations", [])
+            repetition_recovery_used = restored_state.get("repetition_recovery_used", False)
+            repair_attempts = restored_state.get("repair_attempts", 0)
+            applied_interactions[:] = restored_state.get("applied_interactions", [])
+            restore_context(builtin_context, restored_state.get("context", {}))
+            for field in fields(loop):
+                value = restored_state.get("loop", {}).get(field.name)
+                if value is not None:
+                    setattr(loop, field.name, set(value) if field.name == "successful_tool_names" else value)
+            resume_iteration = restored_state.get("next_iteration", 0)
+            pending_message = restored_state.get("pending_message")
+            await emit("recovery.resumed", {"checkpoint_revision": checkpoint_revision,
+                                             "iteration": resume_iteration + 1})
+            if restored_state.get("phase") == "completed":
+                completion_metadata.update(restored_state.get("completion_metadata", {}))
+                return restored_state["answer"], ""
 
         evidence_tools = required_evidence_tools(query or "", available_tool_names)
         loop.required_evidence_tools = evidence_tools
@@ -1252,12 +1485,16 @@ async def run_harness(
                 )
             issues.extend(plan_completion_issues())
             issues.extend(builtin_tools.completion_artifact_issues(builtin_context))
+            if guided and tools:
+                issues.append("用户引导尚未执行：执行预算已结束，请继续任务以处理新目标")
             revisions = 0
             loop.successful_tools = successful_tools
             loop.successful_tool_names = set(successful_tool_names)
             loop.verification_issues = list(issues)
             def has_unrepairable_issue(values: list[str]) -> bool:
                 return (
+                    any(value.startswith("用户引导尚未执行：") for value in values)
+                    or
                     any(value.startswith("缺少任务所需证据工具：") for value in values)
                     or "没有任何工具成功证据" in values
                     or any(value.startswith("计划仍有未完成步骤：") for value in values)
@@ -1266,16 +1503,20 @@ async def run_harness(
                     or any(value.startswith("计划存在跳过步骤：") for value in values)
                     or any(value.startswith("缺少任务所需图片产物：") for value in values)
                     or any(value.startswith("缺少任务所需 Word 产物：") for value in values)
+                    or any(value.startswith(("缺少任务所需 PPT 产物：", "缺少任务所需 PPTX 产物：")) for value in values)
                 )
 
             def has_hard_issue(values: list[str]) -> bool:
                 return (
+                    any(value.startswith("用户引导尚未执行：") for value in values)
+                    or
                     FALSE_WEB_DENIAL_ISSUE in values
                     or any(value.startswith("缺少任务所需证据工具：") for value in values)
                     or "没有任何工具成功证据" in values
                     or any(value.startswith("计划仍有未完成步骤：") for value in values)
                     or any(value.startswith("缺少任务所需图片产物：") for value in values)
                     or any(value.startswith("缺少任务所需 Word 产物：") for value in values)
+                    or any(value.startswith(("缺少任务所需 PPT 产物：", "缺少任务所需 PPTX 产物：")) for value in values)
                 )
 
             if issues and has_unrepairable_issue(issues):
@@ -1291,6 +1532,7 @@ async def run_harness(
                 issues
                 and not has_unrepairable_issue(issues)
                 and revisions < policies.verification_max_revisions
+                and execution_options["review"]["mode"] != "off"
             ):
                 revisions += 1
                 loop.revision_count = revisions
@@ -1313,7 +1555,7 @@ async def run_harness(
                         + "；".join(issues)
                     ),
                 })
-                revised = (await llm.chat_with_tools(messages, tools=None)).get("content") or ""
+                revised = (await stage_call("critic", messages, tools=None)).get("content") or ""
                 loop.model_calls += 1
                 answer = _clean(revised)
                 issues = verify_answer(
@@ -1338,6 +1580,10 @@ async def run_harness(
                 issues.extend(builtin_tools.completion_artifact_issues(builtin_context))
                 loop.verification_issues = list(issues)
             hard_failure = has_hard_issue(issues)
+            if repair_attempts:
+                await emit("verification.repair.completed", {
+                    "attempt": repair_attempts, "issues_count": len(issues), "ok": not issues,
+                })
             summary = plan_summary()
             plan_passed = not active_plan or summary["all_completed"]
             completion_status = "completed" if not issues else "completed_with_issues"
@@ -1430,6 +1676,7 @@ async def run_harness(
                 "plan_summary": summary,
                 "checkpoint": loop.checkpoint(),
             })
+            save_runtime("completed", loop.iteration, answer=answer)
             # 保留二元返回值以兼容现有调用者，但绝不把原始 <think> 内容带出
             # Harness。可审计信息由结构化计划、工具、批准和验证事件提供。
             return answer, ""
@@ -1440,6 +1687,19 @@ async def run_harness(
             name: str, args: dict, *, call_id: str, source: str, targets: list[str]
         ):
             nonlocal execution_announced, successful_tools
+            contract = catalog.get(name)
+            repairs, argument_errors = [], []
+            if contract is not None:
+                args, repairs, argument_errors = repair_arguments(
+                    contract.input_schema, args, enabled=policies.argument_repair
+                )
+            if contract is not None and not argument_errors:
+                # Check before tool.called can publish argument-derived targets.
+                await enforce_content(
+                    "tool_input", args, user_id=builtin_context.user_id,
+                    agent_id=builtin_context.agent_id,
+                    provider_id=getattr(llm, "provider_id", None), runtime_event=runtime_event,
+                )
             if not execution_announced:
                 await emit("task.status", {"status": "executing"})
                 execution_announced = True
@@ -1457,9 +1717,10 @@ async def run_harness(
             })
             await emit("tool.called", {
                 "tool": name,
+                "call_id": call_id,
                 "iteration": 0,
-                "repairs": [],
-                "argument_errors": [],
+                "repairs": repairs,
+                "argument_errors": argument_errors,
                 "targets": targets,
                 "source": source,
             })
@@ -1470,21 +1731,20 @@ async def run_harness(
             timed_out = False
             mcp_metadata: dict = {}
             try:
-                if name in builtin_names:
-                    result = await asyncio.wait_for(
-                        builtin_tools.execute(name, args, builtin_context),
-                        timeout=policies.tool_timeout_seconds,
-                    )
-                elif name in routes:
-                    args, mcp_metadata = prepare_mcp_call(name, args)
-                    result = await asyncio.wait_for(
-                        execute_mcp_call(name, args, mcp_metadata),
-                        timeout=policies.tool_timeout_seconds,
-                    )
+                if contract is None:
+                    result = unavailable_tool_result(name)
+                    await emit("tool.rejected", {
+                        "tool": name, "call_id": call_id, "iteration": 0,
+                        "reason": "tool_unavailable", "source": source,
+                    })
+                elif argument_errors:
+                    result = "参数校验失败：" + "；".join(argument_errors)
+                    error_type = "argument_validation"
                 else:
-                    result = f"未知工具：{name}"
-                    error_type = "unknown_tool"
-            except ApprovalRequired:
+                    if contract.kind == "mcp":
+                        args, mcp_metadata = prepare_mcp_call(name, args)
+                    result = await dispatch_tool(contract, args, call_id, mcp_metadata)
+            except (ApprovalRequired, UnknownToolOutcome, InvocationPersistenceError):
                 raise
             except asyncio.TimeoutError:
                 result = f"工具调用失败：超过 {policies.tool_timeout_seconds:g} 秒"
@@ -1497,6 +1757,11 @@ async def run_harness(
                 error_code = str(
                     getattr(exc, "status_code", "") or getattr(exc, "code", "") or ""
                 )[:64]
+            await enforce_content(
+                "tool_output", getattr(result, "raw", result), user_id=builtin_context.user_id,
+                agent_id=builtin_context.agent_id,
+                provider_id=getattr(llm, "provider_id", None), runtime_event=runtime_event,
+            )
             observation = analyze_observation(result, policies.max_tool_output_chars)
             if observation.ok:
                 successful_tools += 1
@@ -1508,6 +1773,7 @@ async def run_harness(
             })
             await emit("tool.completed", {
                 "tool": name,
+                "call_id": call_id,
                 "ok": observation.ok,
                 "repeated": False,
                 "result_chars": len(observation.raw),
@@ -1519,10 +1785,10 @@ async def run_harness(
                 "timeout": timed_out or observation.error_type == "timeout",
                 "retry_count": 0,
             })
-            return observation, result
+            return observation, observation.raw
 
         search_results = []
-        if "web_search" in evidence_tools:
+        if not restored_state and "web_search" in evidence_tools:
             observation, result = await run_preflight_tool(
                 "web_search",
                 preflight_arguments("web_search", query or ""),
@@ -1536,8 +1802,8 @@ async def run_harness(
         # 内置 web_fetch 使用统一 URL schema，可安全地从搜索结果确定性补齐正文证据。
         # 最多尝试四个候选；空正文、受限内容或单站故障不会阻断后续来源。
         if (
-            "web_fetch" in evidence_tools
-            and "web_fetch" in builtin_names
+            not restored_state and "web_fetch" in evidence_tools
+            and catalog.is_kind("web_fetch", "builtin")
             and evidence_capability_name("web_fetch") not in {
                 evidence_capability_name(item) for item in successful_tool_names
             }
@@ -1570,83 +1836,122 @@ async def run_harness(
             loop.model_calls += 1
             return await finalize(raw)
 
-        cache: dict[str, str] = {}
-        signature_counts: dict[str, int] = {}
-        recent_observations: list[str] = []
-        requires_initial_plan = bool(plan_tool and _needs_task_plan(query or ""))
-        for iteration in range(policies.max_iterations):
+        for iteration in range(resume_iteration, policies.max_iterations):
             loop.iteration = iteration + 1
             await emit("loop.iteration.started", {
                 "iteration": loop.iteration,
                 "checkpoint": loop.checkpoint(),
             })
-            await apply_guidance()
-            await report("规划与推理中…" if iteration == 0 else f"观察结果并继续（{iteration + 1}）…")
-            offered_tools = (
-                route_tools(
-                    tools,
-                    "\n".join([query or "", *recent_observations[-2:]]),
-                    threshold=policies.router_activation_threshold,
-                    limit=policies.router_max_candidates,
+            if pending_message is not None:
+                message = pending_message
+                pending_message = None
+                initial_planning_turn = requires_initial_plan and not active_plan
+            else:
+                await apply_guidance()
+                await report("规划与推理中…" if iteration == 0 else f"观察结果并继续（{iteration + 1}）…")
+                offered_tools = (
+                    route_tools(
+                        tools,
+                        "\n".join([query or "", *recent_observations[-2:]]),
+                        threshold=policies.router_activation_threshold,
+                        limit=policies.router_max_candidates,
+                        preferred_names=preferred_names,
+                    )
+                    if policies.router_enabled else tools
                 )
-                if policies.router_enabled else tools
-            )
-            missing_evidence = missing_evidence_capabilities()
-            if missing_evidence:
-                evidence_candidates = [
-                    item for item in tools
-                    if evidence_capability_name(
-                        str((item.get("function") or {}).get("name") or "")
-                    ) in missing_evidence
-                ]
-                if budgeted_successful_tools >= policies.max_successful_calls:
-                    # 常规预算已耗尽时只开放尚缺的强制证据能力；仍受 max_iterations
-                    # 限制，既避免重复搜索挤占正文抓取，也不会形成无限循环。
-                    offered_tools = evidence_candidates
-                    messages.append({
-                        "role": "system",
-                        "content": (
-                            "常规工具预算已用完，但完成门禁仍缺少证据能力："
-                            + "、".join(sorted(missing_evidence))
-                            + "。下一步只能调用所提供的缺失证据工具；不要继续重复搜索。"
-                        ),
-                    })
-                else:
-                    evidence_candidate_names = {
-                        str((item.get("function") or {}).get("name") or "")
-                        for item in evidence_candidates
-                    }
-                    offered_tools = [
-                        *evidence_candidates,
-                        *[
-                            item for item in offered_tools
-                            if str((item.get("function") or {}).get("name") or "")
-                            not in evidence_candidate_names
-                        ],
+                if (execution_options["tool_routing"]["mode"] == "model"
+                        and len(offered_tools) > 1
+                        and not (requires_initial_plan and not active_plan)):
+                    selection_messages, selection_tools = tool_selection_request(query, offered_tools)
+                    preferred_candidates = [item for item in offered_tools
+                                            if item["function"]["name"] in preferred_names]
+                    try:
+                        selection = await stage_call("router", selection_messages, tools=selection_tools)
+                        offered_tools, decision = parse_tool_selection(
+                            selection, offered_tools,
+                            execution_options["tool_routing"]["confidence_threshold"],
+                        )
+                    except Exception as exc:
+                        if isinstance(exc, ApprovalRequired) or getattr(exc, "code", "") == "guardrail_content_blocked":
+                            raise
+                        decision = {"source": "deterministic", "decision": "model_unavailable",
+                                    "confidence_kind": "model_estimate"}
+                    loop.model_calls += 1
+                    # A selector may narrow general candidates, but must not hide
+                    # the user's explicit MCP choice from the execution model.
+                    selected_names = {item["function"]["name"] for item in offered_tools}
+                    offered_tools += [item for item in preferred_candidates
+                                      if item["function"]["name"] not in selected_names]
+                    await emit("tools.selection", {**decision, "offered": [
+                        (item.get("function") or {}).get("name", "") for item in offered_tools
+                    ]})
+                missing_evidence = missing_evidence_capabilities()
+                if missing_evidence:
+                    evidence_candidates = [
+                        item for item in tools
+                        if evidence_capability_name(
+                            str((item.get("function") or {}).get("name") or "")
+                        ) in missing_evidence
                     ]
-            # 对明显的多任务目标，首轮只暴露计划控制能力，促使模型在执行前确定
-            # 完整分母。工具调用、循环迭代等运行操作不会成为计划步骤。
-            if requires_initial_plan and not active_plan:
-                offered_tools = [plan_tool]
-            elif plan_tool and active_plan and plan_tool not in offered_tools:
-                # 已建立计划后仍持续开放控制能力，让模型能在完成每一步时同步
-                # 状态，也能在观察结果改变范围时修订计划。
-                offered_tools = [plan_tool, *offered_tools]
-            if not execution_announced and (not requires_initial_plan or active_plan):
-                await emit("task.status", {"status": "executing"})
-                execution_announced = True
-            if len(offered_tools) < len(tools):
-                await emit("tools.routed", {
-                    "total": len(tools),
-                    "offered": [
-                        item.get("function", {}).get("name", "") for item in offered_tools
-                    ],
-                })
-            message = await llm.chat_with_tools(messages, offered_tools)
-            loop.model_calls += 1
-            messages.append(message)
+                    if budgeted_successful_tools >= policies.max_successful_calls:
+                        # 常规预算已耗尽时只开放尚缺的强制证据能力；仍受 max_iterations
+                        # 限制，既避免重复搜索挤占正文抓取，也不会形成无限循环。
+                        offered_tools = evidence_candidates
+                        messages.append({
+                            "role": "system",
+                            "content": (
+                                "常规工具预算已用完，但完成门禁仍缺少证据能力："
+                                + "、".join(sorted(missing_evidence))
+                                + "。下一步只能调用所提供的缺失证据工具；不要继续重复搜索。"
+                            ),
+                        })
+                    else:
+                        evidence_candidate_names = {
+                            str((item.get("function") or {}).get("name") or "")
+                            for item in evidence_candidates
+                        }
+                        offered_tools = [
+                            *evidence_candidates,
+                            *[
+                                item for item in offered_tools
+                                if str((item.get("function") or {}).get("name") or "")
+                                not in evidence_candidate_names
+                            ],
+                        ]
+                # 对明显的多任务目标，首轮只暴露计划控制能力，促使模型在执行前确定
+                # 完整分母。工具调用、循环迭代等运行操作不会成为计划步骤。
+                if requires_initial_plan and not active_plan:
+                    offered_tools = [plan_tool]
+                elif plan_tool and active_plan and plan_tool not in offered_tools:
+                    # 已建立计划后仍持续开放控制能力，让模型能在完成每一步时同步
+                    # 状态，也能在观察结果改变范围时修订计划。
+                    offered_tools = [plan_tool, *offered_tools]
+                if not execution_announced and (not requires_initial_plan or active_plan):
+                    await emit("task.status", {"status": "executing"})
+                    execution_announced = True
+                if len(offered_tools) < len(tools):
+                    await emit("tools.routed", {
+                        "total": len(tools),
+                        "offered": [
+                            item.get("function", {}).get("name", "") for item in offered_tools
+                        ],
+                    })
+                initial_planning_turn = requires_initial_plan and not active_plan
+                message = (
+                    await stage_call("planner", messages, tools=offered_tools)
+                    if initial_planning_turn
+                    else await llm.chat_with_tools(messages, offered_tools)
+                )
+                loop.model_calls += 1
+                messages.append(message)
+                save_runtime("pending", iteration, pending=message)
             calls = message.get("tool_calls") or []
             if not calls:
+                if await apply_guidance():
+                    if iteration + 1 < policies.max_iterations:
+                        save_runtime("ready", iteration + 1)
+                        continue
+                    raise CompletionVerificationError("用户引导尚未执行：执行预算已结束，请继续任务以处理新目标")
                 if requires_initial_plan and not active_plan and iteration == 0:
                     messages.append({
                         "role": "system",
@@ -1655,6 +1960,32 @@ async def run_harness(
                             "不要直接作答，也不要把工具操作列为任务步骤。"
                         ),
                     })
+                    continue
+                action_issues = builtin_tools.completion_artifact_issues(builtin_context)
+                missing = missing_evidence_capabilities()
+                if missing:
+                    action_issues.append("缺少任务所需证据工具：" + "、".join(sorted(missing)))
+                if policies.require_successful_tool and successful_tools == 0:
+                    action_issues.append("没有任何工具成功证据")
+                if (
+                    action_issues and repair_attempts < policies.verification_max_revisions
+                    and iteration + 1 < policies.max_iterations
+                    and budgeted_successful_tools < policies.max_successful_calls
+                    and execution_options["review"]["mode"] != "off"
+                ):
+                    repair_attempts += 1
+                    await emit("verification.repair.started", {
+                        "attempt": repair_attempts, "issues_count": len(action_issues),
+                    })
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "完成验证发现缺少实际执行证据。请在现有工具权限和预算内调用工具修复："
+                            + "；".join(action_issues)
+                            + "。不能仅改写答复来声称已完成；工具执行后重新验证，无法补齐时如实说明。"
+                        ),
+                    })
+                    save_runtime("ready", iteration + 1)
                     continue
                 unfinished_steps = [
                     item["step"] for item in active_plan
@@ -1673,53 +2004,115 @@ async def run_harness(
                 return await finalize(message.get("content") or "")
             repeated = 0
             executed = 0
-            for index, call in enumerate(calls):
-                function = call.get("function") or {}
-                name = canonical_tool_name(
-                    function.get("name", ""),
-                    available_tool_names,
+            business_dispatched = 0
+            remaining_business_budget = max(0, policies.max_successful_calls - budgeted_successful_tools)
+            iteration_signatures: list[str] = []
+            async def process_call(index, call):
+                nonlocal executed, repeated, successful_tools, budgeted_successful_tools, business_dispatched
+                call_messages, call_observations = [], []
+                raw_function = call.get("function")
+                function = raw_function if isinstance(raw_function, dict) else {}
+                call["function"] = function
+                normalized = repair_tool_call(
+                    raw_function, {UPDATE_PLAN} if initial_planning_turn else available_tool_names
                 )
+                name = normalized.name or "invalid_tool_call"
                 function["name"] = name
+                if normalized.repaired:
+                    function["arguments"] = (
+                        json.dumps(normalized.arguments, ensure_ascii=False)
+                        if isinstance(normalized.arguments, dict) else normalized.arguments
+                    )
                 call["id"] = call.get("id") or f"call_{iteration}_{index}"
-                if executed >= policies.max_parallel_calls:
+                contract = None if normalized.error else catalog.get(name)
+                if initial_planning_turn and name != UPDATE_PLAN:
+                    contract = None
+                if contract is None:
+                    # 授权目录是硬边界；候选路由仅帮助模型选择，不能授予执行权限。
+                    failure = ({"ok": False, "error": {
+                        "type": "tool_protocol", "code": "invalid_tool_call",
+                        "message": normalized.error,
+                    }} if normalized.error else unavailable_tool_result(name))
+                    observation = analyze_observation(failure, policies.max_tool_output_chars)
+                    call_messages.append({
+                        "role": "tool", "tool_call_id": call["id"],
+                        "content": observation.summary,
+                    })
+                    call_observations.append(observation.summary)
+                    await emit("tool.called", {
+                        "tool": name, "call_id": call["id"],
+                        "iteration": iteration + 1, "repairs": [],
+                        "argument_errors": [], "targets": [],
+                    })
+                    await emit("tool.rejected", {
+                        "tool": name, "call_id": call["id"],
+                        "iteration": iteration + 1,
+                        "reason": "invalid_tool_call" if normalized.error else "tool_unavailable",
+                    })
+                    await emit("tool.completed", {
+                        "tool": name, "call_id": call["id"], "ok": False,
+                        "repeated": False, "result_chars": len(observation.raw),
+                        "targets": [], "duration_ms": 0,
+                        "error_type": observation.error_type,
+                        "error_code": observation.error_code,
+                        "timeout": False, "retry_count": 0,
+                    })
+                    return call_messages, call_observations
+                small_step_limit = policies.profile == "small_model" and executed >= policies.max_parallel_calls
+                budget_limit = (
+                    name != UPDATE_PLAN and business_dispatched >= remaining_business_budget
+                    and evidence_capability_name(name) not in missing_evidence_capabilities()
+                )
+                if small_step_limit or budget_limit:
                     deferred = (
                         "[结构化观察]\n状态：未执行\n"
-                        "原因：单步控制策略要求先观察本轮首个动作，再决定下一步。"
+                        + ("原因：单步控制策略要求先观察本轮首个动作，再决定下一步。" if small_step_limit else
+                           "原因：业务工具预算已用完。")
                     )
-                    messages.append({
+                    call_messages.append({
                         "role": "tool", "tool_call_id": call["id"], "content": deferred,
                     })
-                    recent_observations.append(deferred)
-                    await emit("tool.deferred", {"tool": name, "iteration": iteration + 1})
-                    continue
+                    call_observations.append(deferred)
+                    await emit("tool.deferred", {
+                        "tool": name, "call_id": call["id"], "iteration": iteration + 1
+                    })
+                    return call_messages, call_observations
                 executed += 1
+                if name != UPDATE_PLAN:
+                    business_dispatched += 1
                 invalid_json = False
                 try:
                     args = json.loads(function.get("arguments") or "{}")
-                except json.JSONDecodeError:
+                except (TypeError, json.JSONDecodeError):
                     args = {}
                     invalid_json = True
-                if name == UPDATE_PLAN and "plan" not in args and "steps" in args:
+                if (
+                    name == UPDATE_PLAN and isinstance(args, dict)
+                    and "plan" not in args and "steps" in args
+                ):
                     # 兼容已经排队、仍使用旧字段名的 Turn；新 schema 统一要求 plan。
                     args["plan"] = args.pop("steps")
-                spec = next(
-                    (
-                        item.get("function") or {}
-                        for item in tools
-                        if (item.get("function") or {}).get("name") == name
-                    ),
-                    {},
-                )
                 args, repairs, argument_errors = repair_arguments(
-                    spec.get("parameters"), args, enabled=policies.argument_repair
+                    contract.input_schema, args, enabled=policies.argument_repair
                 )
+                if normalized.repaired:
+                    repairs.insert(0, "工具调用格式已规范化")
                 if invalid_json:
                     argument_errors.insert(0, "参数不是有效 JSON")
                 mcp_metadata: dict = {}
-                if not argument_errors and name in routes:
+                if not argument_errors and contract.kind == "mcp":
                     args, mcp_metadata = prepare_mcp_call(name, args)
+                if not argument_errors:
+                    # Covers control/resource/skill/agent tools too, before any
+                    # argument-derived preview is made public.
+                    await enforce_content(
+                        "tool_input", args, user_id=builtin_context.user_id,
+                        agent_id=builtin_context.agent_id,
+                        provider_id=getattr(llm, "provider_id", None), runtime_event=runtime_event,
+                    )
                 signature = name + "|" + json.dumps(args, sort_keys=True, ensure_ascii=False)
                 signature_counts[signature] = signature_counts.get(signature, 0) + 1
+                iteration_signatures.append(signature)
                 cache_hit = signature in cache
                 public_targets = []
                 if name in {"read", "write", "edit"} and args.get("path"):
@@ -1734,11 +2127,12 @@ async def run_harness(
                         str(item.get("path")) for item in (args.get("files") or [])
                         if isinstance(item, dict) and item.get("path")
                     ][:3]
-                elif name in routes:
+                elif contract.kind == "mcp":
                     public_targets = [str(mcp_metadata.get("preview") or "")]
                 if name != UPDATE_PLAN:
                     await emit("tool.called", {
                         "tool": name,
+                        "call_id": call["id"],
                         "iteration": iteration + 1,
                         "repairs": repairs,
                         "argument_errors": argument_errors,
@@ -1757,83 +2151,13 @@ async def run_harness(
                 elif argument_errors:
                     result = "参数校验失败：" + "；".join(argument_errors)
                     error_type = "argument_validation"
-                elif name == UPDATE_PLAN:
-                    result = await apply_plan_update(args)
-                elif name == READ_SKILL_RESOURCE:
-                    await report("读取 Skill 资源…")
-                    result = resource_index.get((args.get("skill"), args.get("file")), "未找到资源")
-                elif name == CREATE_SKILL and skill_builder:
-                    await report("创建 Skill…")
+                else:
+                    await report(f"调用工具：{name}…")
                     try:
-                        result = await asyncio.wait_for(
-                            skill_builder(args), timeout=policies.tool_timeout_seconds
+                        result = await dispatch_tool(
+                            contract, args, f"iteration_{iteration}:{call['id']}", mcp_metadata
                         )
-                    except asyncio.TimeoutError:
-                        result = f"工具调用失败：超过 {policies.tool_timeout_seconds:g} 秒"
-                        error_type = "timeout"
-                        error_code = "timeout"
-                        timed_out = True
-                    except Exception as exc:  # noqa: BLE001 - 交给循环选择替代动作
-                        result = f"工具调用失败：{exc}"
-                        error_type = type(exc).__name__[:64]
-                        error_code = str(
-                            getattr(exc, "status_code", "")
-                            or getattr(exc, "code", "") or ""
-                        )[:64]
-                elif name in agent_routes:
-                    await report(f"委派给 {agent_routes[name].get('name', '子智能体')}…")
-                    try:
-                        result = await asyncio.wait_for(
-                            _run_descriptor(
-                                agent_routes[name], args.get("query") or query, progress,
-                                builtin_context, call.get("id") or "",
-                            ),
-                            timeout=policies.tool_timeout_seconds,
-                        )
-                    except ApprovalRequired:
-                        raise
-                    except asyncio.TimeoutError:
-                        result = f"工具调用失败：超过 {policies.tool_timeout_seconds:g} 秒"
-                        error_type = "timeout"
-                        error_code = "timeout"
-                        timed_out = True
-                    except Exception as exc:  # noqa: BLE001 - 交给循环选择替代动作
-                        result = f"工具调用失败：{exc}"
-                        error_type = type(exc).__name__[:64]
-                        error_code = str(
-                            getattr(exc, "status_code", "")
-                            or getattr(exc, "code", "") or ""
-                        )[:64]
-                elif name in builtin_names:
-                    await report(f"调用内置工具：{name}…")
-                    try:
-                        result = await asyncio.wait_for(
-                            builtin_tools.execute(name, args, builtin_context),
-                            timeout=policies.tool_timeout_seconds,
-                        )
-                    except ApprovalRequired:
-                        raise
-                    except asyncio.TimeoutError:
-                        result = f"工具调用失败：超过 {policies.tool_timeout_seconds:g} 秒"
-                        error_type = "timeout"
-                        error_code = "timeout"
-                        timed_out = True
-                    except Exception as exc:  # noqa: BLE001 - 交给循环选择替代动作
-                        result = f"工具调用失败：{exc}"
-                        error_type = type(exc).__name__[:64]
-                        error_code = str(
-                            getattr(exc, "status_code", "")
-                            or getattr(exc, "code", "") or ""
-                        )[:64]
-                elif name in routes:
-                    remote_name = str(mcp_metadata.get("remote_tool") or name)
-                    await report(f"调用工具：{remote_name}…")
-                    try:
-                        result = await asyncio.wait_for(
-                            execute_mcp_call(name, args, mcp_metadata),
-                            timeout=policies.tool_timeout_seconds,
-                        )
-                    except ApprovalRequired:
+                    except (ApprovalRequired, UnknownToolOutcome, InvocationPersistenceError):
                         raise
                     except asyncio.TimeoutError:
                         result = f"工具调用失败：超过 {policies.tool_timeout_seconds:g} 秒"
@@ -1843,13 +2167,12 @@ async def run_harness(
                     except Exception as exc:
                         result = f"工具调用失败：{exc}"
                         error_type = type(exc).__name__[:64]
-                        error_code = str(
-                            getattr(exc, "status_code", "")
-                            or getattr(exc, "code", "") or ""
-                        )[:64]
-                else:
-                    result = f"未知工具：{name}"
-                    error_type = "unknown_tool"
+                        error_code = str(getattr(exc, "status_code", "") or getattr(exc, "code", "") or "")[:64]
+                await enforce_content(
+                    "tool_output", getattr(result, "raw", result), user_id=builtin_context.user_id,
+                    agent_id=builtin_context.agent_id,
+                    provider_id=getattr(llm, "provider_id", None), runtime_event=runtime_event,
+                )
                 observation = analyze_observation(result, policies.max_tool_output_chars)
                 if observation.ok and not cache_hit and name != UPDATE_PLAN:
                     successful_tools += 1
@@ -1860,12 +2183,13 @@ async def run_harness(
                     loop.successful_tools = successful_tools
                     loop.successful_tool_names = set(successful_tool_names)
                 result = observation.summary
-                cache[signature] = result
-                recent_observations.append(result[:2000])
-                messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+                cache[signature] = observation
+                call_observations.append(result[:2000])
+                call_messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
                 if name != UPDATE_PLAN:
                     await emit("tool.completed", {
                         "tool": name,
+                        "call_id": call["id"],
                         "ok": observation.ok,
                         "repeated": cache_hit,
                         "result_chars": len(observation.raw),
@@ -1876,6 +2200,23 @@ async def run_harness(
                         "timeout": timed_out or observation.error_type == "timeout",
                         "retry_count": 0,
                     })
+                return call_messages, call_observations
+
+            scheduled = []
+            for index, call in enumerate(calls):
+                normalized = repair_tool_call(call.get("function"), available_tool_names)
+                entry = catalog.get(normalized.name)
+                scheduled.append(ScheduledCall(
+                    call_id=str(call.get("id") or f"call_{iteration}_{index}"),
+                    run=lambda index=index, call=call: process_call(index, call),
+                    read_only=bool(entry and entry.read_only),
+                ))
+            for call_messages, call_observations in await run_ordered_batch(
+                scheduled, max_parallel_calls=policies.max_parallel_calls
+            ):
+                messages.extend(call_messages)
+                recent_observations.extend(call_observations)
+            save_runtime("ready", iteration + 1)
             saved_chars = compact_tool_observations(
                 messages,
                 budget_chars=policies.tool_context_budget_chars,
@@ -1903,10 +2244,35 @@ async def run_harness(
                     })
                     loop.stop_reason = "successful_tool_budget"
                     break
-            if repeated == executed or (
-                signature_counts
-                and max(signature_counts.values()) >= policies.max_same_tool_calls
+            if (executed > 0 and repeated == executed) or (
+                iteration_signatures
+                and max(signature_counts[s] for s in iteration_signatures)
+                >= policies.max_same_tool_calls
             ):
+                if not repetition_recovery_used and iteration + 1 < policies.max_iterations:
+                    # A cached plan/resource response is not evidence that all useful
+                    # work is exhausted. Give one bounded chance to change the action;
+                    # cached mutating calls remain deduplicated throughout recovery.
+                    repetition_recovery_used = True
+                    recovery = (
+                        "本轮重复了已执行的调用，系统已返回缓存结果，没有再次执行。"
+                        "现在有一次纠正机会：不要重复原参数。根据工具结果更新计划状态，"
+                        "或修正参数、选择已授权的其他工具继续实际工作。"
+                        "已有文件仅代表已生成的部分，必须检查是否满足用户完整目标。"
+                    )
+                    if builtin_context.artifacts:
+                        recovery += " 已生成文件：" + "、".join(builtin_context.artifacts)
+                    elif catalog.is_kind("presentation_create", "builtin") and requires_presentation_artifact(query):
+                        recovery += (
+                            " PPTX 尚未生成；presentation_create 可直接使用已载入正文"
+                            "创建逐页中文内容，无需 Shell 或再次读取技能入口。"
+                        )
+                    messages.append({"role": "system", "content": recovery})
+                    await emit("loop.recovery", {
+                        "reason": "repeated_tool_call", "iteration": iteration + 1,
+                        "retry_count": 1,
+                    })
+                    continue
                 await emit("loop.stopped", {
                     "reason": "repeated_tool_call",
                     "iteration": iteration + 1,

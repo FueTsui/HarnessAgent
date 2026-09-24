@@ -14,12 +14,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from ..database import get_db
+from ..guest_access import effective_reasoning_provider
 from ..llm.client import PROVIDER_PRESETS, client_for_provider
 from ..llm.codex_models import (
     available_chatgpt_codex_models,
     preferred_chatgpt_codex_model,
 )
 from ..models import Agent, ModelProvider, TokenUsage, User
+from ..reasoning_options import normalize_reasoning_config, reasoning_capabilities, validate_reasoning_settings
 from ..schemas import ProviderCreate, ProviderOut, ProviderProbe, ProviderUpdate
 from ..security import can_manage, require_module, require_owner, scope_owned
 
@@ -32,6 +34,24 @@ RESERVED_BODY_FIELDS = {
     "temperature", "reasoning", "reasoning_effort", "effort",
 }
 FORBIDDEN_HEADERS = {"host", "content-length", "transfer-encoding", "connection"}
+REASONING_FIELDS = {
+    "provider_type", "base_url", "model_id", "wire_api", "model_reasoning",
+    "reasoning_effort", "reasoning_config", "max_tokens", "max_tokens_param",
+}
+
+
+def _validate_reasoning(provider) -> None:
+    try:
+        validate_reasoning_settings(effective_reasoning_provider(provider))
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+
+def _encoded_reasoning_config(value) -> str:
+    try:
+        return json.dumps(normalize_reasoning_config(value), ensure_ascii=False)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
 
 def _json_dict(value) -> dict:
@@ -93,6 +113,8 @@ def _model_input(value) -> list[str]:
 
 
 def _to_out(p: ModelProvider, user: User | None = None) -> ProviderOut:
+    capabilities = reasoning_capabilities(effective_reasoning_provider(p))
+    capabilities.pop("reasoning_effort", None)  # Keep the stored default editable, including legacy values.
     return ProviderOut(
         id=p.id, name=p.name, provider_type=p.provider_type,
         base_url=p.base_url, model_id=p.model_id,
@@ -109,6 +131,8 @@ def _to_out(p: ModelProvider, user: User | None = None) -> ProviderOut:
         extra_body=_json_dict(getattr(p, "extra_body", "{}")),
         model_list_path=getattr(p, "model_list_path", "/models") or "/models",
         reasoning_effort=getattr(p, "reasoning_effort", "") or "",
+        reasoning_config=_json_dict(getattr(p, "reasoning_config", "{}")),
+        **capabilities,
         max_tokens=int(getattr(p, "max_tokens", 8192) or 8192),
         max_tokens_param=getattr(p, "max_tokens_param", "auto") or "auto",
         timeout_ms=int(getattr(p, "timeout_ms", 120000) or 120000),
@@ -140,6 +164,8 @@ async def discover_models(
     transient.id = None
     transient.custom_headers = json.dumps(_clean_headers(body.custom_headers), ensure_ascii=False)
     transient.extra_body = json.dumps(_clean_extra_body(body.extra_body), ensure_ascii=False)
+    transient.reasoning_config = _encoded_reasoning_config(body.reasoning_config)
+    _validate_reasoning(transient)
     try:
         models = await client_for_provider(transient).list_models()
     except Exception as exc:  # noqa: BLE001
@@ -173,6 +199,8 @@ async def discover_models_for_provider(
         _clean_headers(body.custom_headers, existing_headers), ensure_ascii=False
     )
     values["extra_body"] = json.dumps(_clean_extra_body(body.extra_body), ensure_ascii=False)
+    values["reasoning_config"] = _encoded_reasoning_config(body.reasoning_config)
+    _validate_reasoning(SimpleNamespace(**values))
     try:
         models = await client_for_provider(SimpleNamespace(**values)).list_models()
     except Exception as exc:  # noqa: BLE001
@@ -211,6 +239,7 @@ def create_provider(
         extra_body=json.dumps(_clean_extra_body(body.extra_body), ensure_ascii=False),
         model_list_path=body.model_list_path or "/models",
         reasoning_effort=body.reasoning_effort if body.model_reasoning else "",
+        reasoning_config=_encoded_reasoning_config(body.reasoning_config),
         max_tokens=body.max_tokens,
         max_tokens_param=body.max_tokens_param,
         timeout_ms=body.timeout_ms,
@@ -222,6 +251,7 @@ def create_provider(
         is_public=body.is_public,
         created_by=admin.id,
     )
+    _validate_reasoning(provider)
     db.add(provider)
     db.commit()
     db.refresh(provider)
@@ -239,6 +269,18 @@ def update_provider(
     if provider is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "提供商不存在")
     require_owner(admin, provider)
+    if "reasoning_config" in body.model_fields_set and body.reasoning_config is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "reasoning_config 必须为对象")
+    if REASONING_FIELDS.intersection(body.model_fields_set):
+        merged = {field: getattr(provider, field, None) for field in REASONING_FIELDS}
+        merged["name"] = provider.name
+        merged.update({key: value for key, value in body.model_dump(exclude_unset=True).items()
+                       if key in REASONING_FIELDS and value is not None})
+        if not merged["model_reasoning"]:
+            merged["reasoning_effort"] = ""
+        if "reasoning_config" in body.model_fields_set:
+            merged["reasoning_config"] = _encoded_reasoning_config(body.reasoning_config)
+        _validate_reasoning(SimpleNamespace(**merged))
     is_chatgpt_codex = (
         provider.provider_type == "chatgpt"
         or str(provider.base_url or "").rstrip("/").lower()
@@ -315,6 +357,8 @@ def update_provider(
         )
     if body.extra_body is not None:
         provider.extra_body = json.dumps(_clean_extra_body(body.extra_body), ensure_ascii=False)
+    if body.reasoning_config is not None:
+        provider.reasoning_config = _encoded_reasoning_config(body.reasoning_config)
     if body.enabled is not None:
         provider.enabled = body.enabled
     if body.is_public is not None:

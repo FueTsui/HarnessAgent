@@ -1,0 +1,53 @@
+.admin-page .service-toolbar {margin-top:24px;}
+.admin-page #services-content .module-subnav + .service-toolbar {margin-top:0;}
+.admin-page .service-table td:first-child {width:30%;min-width:200px;}
+.admin-page .service-name {font:inherit;font-weight: var(--font-weight-semibold);color:var(--primary);background:none;border:0;padding:0;text-align:left;cursor:pointer;}
+.admin-page .service-name:disabled {color:var(--muted);cursor:default;}
+.admin-page .service-row-actions {display:flex;gap:6px;align-items:center;white-space:nowrap;}
+.admin-page .service-empty {min-height:390px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;text-align:center;padding:40px 20px;}
+.admin-page .service-empty h3 {font-size: var(--font-size-title);margin:4px 0;}
+.admin-page .service-empty p {color:var(--muted);max-width:490px;line-height: var(--leading-body);margin:0 0 12px;}
+.admin-page .service-empty-icon {display:grid;place-items:center;background:var(--primary-soft);color:var(--primary);width:80px;height:80px;border-radius:24px;margin-bottom:6px;}
+.admin-page .service-dialog {--dialog-padding:28px;width:min(820px,calc(100vw - 32px));max-height:90dvh;border:1px solid var(--line);border-radius:16px;}
+.admin-page .service-dialog-heading {display:flex;align-items:center;justify-content:space-between;margin-bottom:22px;}
+.admin-page .service-dialog-heading h3 {margin:0;}
+.admin-page .service-form-grid {display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:20px;}
+.admin-page .service-form-grid>label {display:flex;flex-direction:column;gap:8px;margin:0;min-width:0;}
+.admin-page .service-form-grid .wide {grid-column:1/-1;}
+.admin-page .service-form-grid input:not([type=checkbox]), .admin-page .service-form-grid textarea, .admin-page .service-form-grid select {margin:0;width:100%;}
+.admin-page .service-form-grid textarea {min-height:88px;}
+.admin-page .service-form-grid .code-area {font-family:var(--font-family-mono);}
+.admin-page .service-form-grid small,.admin-page .service-help,.admin-page .service-footnote {font-size: var(--font-size-caption);color:var(--muted);line-height: var(--leading-body);}
+.admin-page .service-config-section {border-top:1px solid var(--line);padding-top:20px;}
+.admin-page .service-config-section[hidden] {display:none;}
+.admin-page .service-config-section h4 {margin:0 0 12px;}
+.admin-page .service-input-row {display:grid;grid-template-columns:minmax(120px,1fr) 115px 70px 32px;gap:10px;align-items:center;margin-bottom:10px;}
+.admin-page .service-input-row label {display:flex;gap:6px;align-items:center;margin:0;}
+.admin-page .service-agent-choices {max-height:160px;overflow:auto;margin-bottom:10px;}
+.admin-page .service-output {background:var(--surface-subtle);border:1px solid var(--line);border-radius:10px;padding:18px;max-height:300px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font: var(--font-size-body)/var(--leading-body) var(--font-family-mono);}
+.admin-page .service-run-confirm {display:flex;align-items:center;gap:8px;margin:20px 0;font-size: var(--font-size-ui);}
+.admin-page .service-dialog input[type="checkbox"] {width:16px;min-width:16px;height:16px;flex:0 0 16px;margin:0;accent-color:var(--accent);}
+.admin-page #service-run-state {font-size: var(--font-size-ui);color:var(--primary);margin:14px 0;}
+.admin-page .service-footnote {margin-top:20px;}
+:root[data-theme="dark"] .admin-page .service-name {color:var(--primary);}
+:root[data-theme="dark"] .admin-page .service-dialog,
+:root[data-theme="dark"] .admin-page .service-config-section {border-color:var(--line);}
+:root[data-theme="dark"] .admin-page .service-output {background:var(--surface-subtle);border-color:var(--line);color:var(--text);}
+:root[data-theme="dark"] .admin-page .service-empty-icon {background:var(--primary-soft);color:var(--primary);}
+:root[data-theme="dark"] .admin-page .service-help,
+:root[data-theme="dark"] .admin-page .service-form-grid small,
+:root[data-theme="dark"] .admin-page .service-footnote,
+:root[data-theme="dark"] .admin-page .service-empty p {color:var(--muted);}
+@media(max-width:640px) {
+  .admin-page .service-form-grid {grid-template-columns:1fr;}
+  .admin-page .service-dialog {--dialog-padding:20px;}
+  .admin-page .service-input-row {grid-template-columns:minmax(70px,1fr) 84px 60px 28px;gap:4px;}
+}
+
+@media (max-width: 640px) {
+  .admin-page .service-input-row { grid-template-columns: minmax(0, 1fr) 32px; gap: 10px; padding-bottom: 12px; }
+  .admin-page .service-input-row > input { grid-column: 1; }
+  .admin-page .service-input-row > select { grid-column: 1; grid-row: 2; }
+  .admin-page .service-input-row > label { grid-column: 1; grid-row: 3; }
+  .admin-page .service-input-row > button { grid-column: 2; grid-row: 1; }
+}

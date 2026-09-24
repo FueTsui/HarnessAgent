@@ -444,7 +444,12 @@ def validate_policy_routing(
     if len(fallbacks) > 8:
         raise ValueError("故障切换 Provider 最多 8 个")
     rules = []
-    for raw in routing.get("rules") or []:
+    raw_rules = routing.get("rules") or []
+    if not isinstance(raw_rules, list):
+        raise ValueError("模型路由 rules 必须为数组")
+    if len(raw_rules) > 1024:
+        raise ValueError("模型路由规则最多 1024 条；请调整后保存，不会截断已有规则")
+    for raw in raw_rules:
         if not isinstance(raw, dict):
             continue
         match = str(raw.get("match") or "keyword")
@@ -452,7 +457,9 @@ def validate_policy_routing(
             raise ValueError(f"不支持的模型路由匹配类型：{match}")
         provider_id = int(raw.get("provider_id"))
         validate_provider(provider_id)
-        value = str(raw.get("value") or "")[:256]
+        value = str(raw.get("value") or "")
+        if len(value) > 16000:
+            raise ValueError("单条模型路由匹配值最多 16000 字符；请调整后保存，不会截断已有值")
         rules.append({"match": match, "value": value, "provider_id": provider_id})
     return {
         "mode": "policy",
@@ -462,7 +469,7 @@ def validate_policy_routing(
             "lowest_cost" if routing.get("strategy") == "lowest_cost" else "ordered"
         ),
         "health": _normalise_health(routing.get("health")),
-        "rules": rules[:32],
+        "rules": rules,
     }
 
 
@@ -539,6 +546,8 @@ class GovernedLLMClient:
                 })
                 return result
             except Exception as exc:  # noqa: BLE001 - 结构化失败后决定是否切换
+                if getattr(exc, "code", "") == "guardrail_content_blocked":
+                    raise
                 last_error = exc
                 latency = round((time.monotonic() - started) * 1000)
                 await _emit(self._runtime_event, "provider.attempt", {

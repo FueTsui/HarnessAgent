@@ -1,18 +1,17 @@
-/* 公共工具：令牌管理、请求封装、轻量 Markdown 渲染（本地实现，无外部依赖） */
+/* 公共工具：浏览器会话、请求封装、轻量 Markdown 渲染（本地实现，无外部依赖） */
 
 const Auth = {
-  role: () => localStorage.getItem("gca_role"),
-  username: () => localStorage.getItem("gca_username"),
+  user: null,
+  pending: null,
+  role() { return this.user?.role || null; },
+  username() { return this.user?.username || null; },
+  isGuest() { return this.user?.is_guest === true || this.role() === "guest"; },
   modules() {
-    try {
-      const value = JSON.parse(localStorage.getItem("gca_modules") || "[]");
-      return Array.isArray(value) ? value : [];
-    } catch (_) { return []; }
+    return !this.isGuest() && Array.isArray(this.user?.modules) ? this.user.modules : [];
   },
   allModules() {
     if (this.role() === "root") return true;
-    if (localStorage.getItem("gca_all_modules") === null) return this.role() === "admin";
-    return localStorage.getItem("gca_all_modules") === "1";
+    return this.role() === "admin" && this.user?.all_modules === true;
   },
   canModule(module) {
     if (this.role() === "root") return true;
@@ -20,35 +19,56 @@ const Auth = {
     return this.modules().includes(module);
   },
   canAccessSettings() {
-    return this.role() === "root" || this.role() === "admin" || this.modules().length > 0;
+    return Boolean(this.user && !this.isGuest());
   },
   save(data) {
-    localStorage.setItem("gca_role", data.role);
-    localStorage.setItem("gca_username", data.username);
-    if (data.all_modules !== undefined) {
-      localStorage.setItem("gca_all_modules", data.all_modules ? "1" : "0");
-    }
-    if (data.modules !== undefined) {
-      localStorage.setItem("gca_modules", JSON.stringify(data.modules || []));
-    }
+    this.clear();
+    this.user = data;
+    return data;
   },
   clear() {
+    this.user = null;
+    localStorage.removeItem("gca_token");
     localStorage.removeItem("gca_role");
     localStorage.removeItem("gca_username");
     localStorage.removeItem("gca_all_modules");
     localStorage.removeItem("gca_modules");
   },
-  requireLogin() {
-    if (this.username()) return;
-    fetch("/api/v1/auth/me").then(async response => {
-      if (!response.ok) { location.href = "/login"; return; }
-      this.save(await response.json());
-    }).catch(() => { location.href = "/login"; });
+  async readSession() {
+    const response = await fetch("/api/v1/auth/me", {credentials: "same-origin"});
+    if (response.status === 401) { this.clear(); return null; }
+    if (!response.ok) throw new Error("无法读取浏览器会话，请重试");
+    return this.save(await response.json());
+  },
+  async ensureSession() {
+    if (this.pending) return this.pending;
+    this.pending = (async () => {
+      const existing = await this.readSession();
+      if (existing && !this.isGuest()) return existing;
+      this.clear();
+      location.href = "/login";
+      throw new Error("请登录后使用问答");
+    })();
+    try { return await this.pending; }
+    finally { this.pending = null; }
+  },
+  async requireLogin() {
+    const user = await this.readSession();
+    if (!user || this.isGuest()) { location.href = "/login"; return null; }
+    return user;
+  },
+  async verifyCurrentSession() {
+    const previous = this.user?.id;
+    const user = await this.readSession();
+    if (!user || user.id !== previous) { location.reload(); return false; }
+    return true;
   },
   isAdmin() {
     return ["root", "admin"].includes(this.role());
   },
 };
+// Browser storage is never an identity or permission source.
+Auth.clear();
 
 async function api(path, options = {}) {
   const headers = options.headers || {};
@@ -56,11 +76,10 @@ async function api(path, options = {}) {
     headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(options.json);
   }
-  const resp = await fetch(path, { ...options, headers });
-  if (resp.status === 401) {
+  const resp = await fetch(path, { ...options, headers, credentials: "same-origin" });
+  if (resp.status === 401 && path !== "/api/v1/auth/login") {
     Auth.clear();
     location.href = "/login";
-    throw new Error("登录已失效");
   }
   if (!resp.ok) {
     let detail = resp.statusText;
@@ -74,7 +93,7 @@ async function api(path, options = {}) {
 }
 
 async function downloadAuthenticated(path, filename) {
-  const resp = await fetch(path);
+  const resp = await fetch(path, {credentials: "same-origin"});
   if (resp.status === 401) {
     Auth.clear();
     location.href = "/login";
@@ -201,6 +220,7 @@ const ICON_PATHS = {
   logout: '<path d="M10 17l5-5-5-5M15 12H3"/><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>',
   sparkles: '<path d="m12 3 1.2 3.8L17 8l-3.8 1.2L12 13l-1.2-3.8L7 8l3.8-1.2Z"/><path d="m19 14 .7 2.3L22 17l-2.3.7L19 20l-.7-2.3L16 17l2.3-.7ZM5 15l.8 2.2L8 18l-2.2.8L5 21l-.8-2.2L2 18l2.2-.8Z"/>',
   history: '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/>',
+  brain: '<path d="M12 5a3 3 0 0 0-5.8-1A4 4 0 0 0 3 10a4 4 0 0 0 1 7.5A4 4 0 0 0 12 19V5Zm0 0a3 3 0 0 1 5.8-1A4 4 0 0 1 21 10a4 4 0 0 1-1 7.5A4 4 0 0 1 12 19"/><path d="M7 8c0 2 1 3 3 3m7-3c0 2-1 3-3 3M7 17c0-2 1-3 3-3m7 3c0-2-1-3-3-3"/>',
   external: '<path d="M15 3h6v6M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
   key: '<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M15 8l3 3M17 6l3 3"/>',
   shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/>',
@@ -280,7 +300,88 @@ document.addEventListener("click", async event => {
   setTimeout(() => { button.innerHTML = `${icon("copy", 14)}复制`; }, 1400);
 });
 
-const Theme = {
+const Theme = (() => {
+  const palette = Object.freeze([
+    {id: "default", label: "默认", color: "#3b82f6"},
+    {id: "blue", label: "蓝色", color: "#3b82f6"},
+    {id: "green", label: "绿色", color: "#4caf50"},
+    {id: "yellow", label: "黄色", color: "#facc15"},
+    {id: "pink", label: "粉色", color: "#ec4899"},
+    {id: "orange", label: "橙色", color: "#f97316"},
+    {id: "purple", label: "紫色", color: "#8b5cf6"},
+    {id: "black", label: "黑色", color: "#000000"},
+    {id: "custom", label: "自定义", color: "#8b5cf6"},
+  ].map(Object.freeze));
+  const validHex = value => typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value);
+  const rgb = hex => [1, 3, 5].map(offset => parseInt(hex.slice(offset, offset + 2), 16));
+  const hex = channels => "#" + channels.map(c => Math.round(c).toString(16).padStart(2, "0")).join("");
+  const mix = (a, b, weight) => hex(rgb(a).map((c, i) => c * (1 - weight) + rgb(b)[i] * weight));
+  function luminance(color) {
+    return rgb(color).reduce((sum, c, i) => {
+      const value = c / 255;
+      return sum + (value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4) * [.2126, .7152, .0722][i];
+    }, 0);
+  }
+  function contrast(a, b) {
+    const values = [luminance(a), luminance(b)].sort((x, y) => y - x);
+    return (values[0] + .05) / (values[1] + .05);
+  }
+  function normalize(themeColor = "default", customColor = "#8b5cf6") {
+    if (!palette.some(item => item.id === themeColor) || !validHex(customColor)) {
+      throw new Error("请选择有效主题色，并填写 #RRGGBB 格式的色号");
+    }
+    return {themeColor, customColor: customColor.toLowerCase()};
+  }
+  function colors(themeColor = "default", customColor = "#8b5cf6", dark = false) {
+    const value = normalize(themeColor, customColor);
+    const raw = value.themeColor === "custom" ? value.customColor : palette.find(item => item.id === value.themeColor).color;
+    const soft = mix(dark ? "#212121" : "#ffffff", raw, dark ? .22 : .12);
+    const backgrounds = dark ? ["#212121", "#2b2b2b", "#303030", "#393939", "#404040", soft]
+      : ["#ffffff", "#f5f5f5", "#ebebeb", "#e8e8e8", soft];
+    let primary = raw;
+    // Primary is also used for small labels. Adjust all presets and arbitrary
+    // custom colors against actual surfaces; keep the exact input in the swatch.
+    for (let step = 1; backgrounds.some(bg => contrast(primary, bg) < 4.5) && step <= 100; step++) {
+      primary = mix(raw, dark ? "#ffffff" : "#000000", step / 100);
+    }
+    const onPrimary = contrast(primary, "#ffffff") >= contrast(primary, "#000000") ? "#ffffff" : "#000000";
+    return {
+      "--theme-swatch": raw,
+      "--primary": primary,
+      "--primary-hover": mix(primary, dark ? "#ffffff" : "#000000", .12),
+      "--accent": primary,
+      "--accent-contrast": onPrimary,
+      "--surface-active": soft,
+      "--accent-soft": soft,
+      "--primary-soft": soft,
+      "--sidebar-accent": soft,
+      "--primary-line": mix(dark ? "#2b2b2b" : "#ffffff", raw, .4),
+      "--focus-ring": primary,
+      "--selection-background": soft,
+      "--selection-text": dark ? "#ececec" : "#202020",
+    };
+  }
+  function cachedAccent() {
+    try { return normalize(localStorage.getItem("gca_theme_color") || "default", localStorage.getItem("gca_custom_color") || "#8b5cf6"); }
+    catch (_) { return normalize(); }
+  }
+  let accent = cachedAccent();
+  return {
+  palette, colors,
+  setAccent(themeColor = "default", customColor = "#8b5cf6") {
+    accent = normalize(themeColor, customColor);
+    // Server-confirmed values are cached for navigation and other open tabs.
+    try {
+      localStorage.setItem("gca_theme_color", accent.themeColor);
+      localStorage.setItem("gca_custom_color", accent.customColor);
+    } catch (_) { /* Keep the current page usable if storage is unavailable. */ }
+    this.apply();
+  },
+  usePreferences(value) {
+    this.setAccent(value.theme_color ?? "default", value.custom_color ?? "#8b5cf6");
+    localStorage.setItem("gca_theme", value.theme);
+    this.apply(value.theme);
+  },
   current() {
     return localStorage.getItem("gca_theme") || "system";
   },
@@ -288,6 +389,9 @@ const Theme = {
     const dark = mode === "dark" || (mode === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
     document.documentElement.dataset.theme = dark ? "dark" : "light";
     document.documentElement.style.colorScheme = dark ? "dark" : "light";
+    for (const [key, value] of Object.entries(colors(accent.themeColor, accent.customColor, dark))) {
+      document.documentElement.style.setProperty(key, value);
+    }
     document.querySelectorAll("[data-theme-icon]").forEach(el => {
       el.innerHTML = icon(dark ? "sun" : "moon", 18);
     });
@@ -298,11 +402,18 @@ const Theme = {
     this.apply(next);
     showToast(next === "dark" ? "已切换到深色模式" : "已切换到浅色模式");
   },
-};
+  };
+})();
 
 Theme.apply();
 matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => {
   if (Theme.current() === "system") Theme.apply("system");
+});
+window.addEventListener("storage", event => {
+  if (!["gca_theme", "gca_theme_color", "gca_custom_color"].includes(event.key)) return;
+  try {
+    Theme.setAccent(localStorage.getItem("gca_theme_color") || "default", localStorage.getItem("gca_custom_color") || "#8b5cf6");
+  } catch (_) { /* Invalid local cache never becomes a CSS value. */ }
 });
 
 function initTopbar() {
@@ -316,12 +427,16 @@ function initTopbar() {
   if (location.pathname.startsWith("/admin")) {
     html += `<a class="btn small ghost" href="/">${icon("external", 14)}对话页</a>`;
   }
-  html += `<button class="btn small ghost" id="topbar-theme" aria-label="切换外观"><span data-theme-icon></span></button>`;
-  html += `<button class="btn small ghost" id="topbar-password">${icon("key", 14)}修改密码</button>`;
+  if (!location.pathname.startsWith("/admin")) {
+    html += `<button class="btn small ghost" id="topbar-theme" aria-label="切换外观"><span data-theme-icon></span></button>`;
+    html += `<button class="btn small ghost" id="topbar-password">${icon("key", 14)}修改密码</button>`;
+  }
   html += `<button class="btn small danger" id="topbar-logout">${icon("logout", 14)}退出</button>`;
   el.innerHTML = html;
-  el.querySelector("#topbar-theme").onclick = () => Theme.toggle();
-  el.querySelector("#topbar-password").onclick = () => openChangePasswordDialog();
+  const themeButton = el.querySelector("#topbar-theme");
+  const passwordButton = el.querySelector("#topbar-password");
+  if (themeButton) themeButton.onclick = () => Theme.toggle();
+  if (passwordButton) passwordButton.onclick = () => openChangePasswordDialog();
   el.querySelector("#topbar-logout").onclick = logout;
   Theme.apply();
   hydrateIcons(el);
@@ -332,13 +447,14 @@ function initTopbar() {
 async function applyBranding() {
   let data;
   try {
-    const resp = await fetch("/api/v1/settings/public");
+    const resp = await fetch("/api/v1/settings/public", {credentials: "same-origin"});
     if (!resp.ok) return;
     data = await resp.json();
   } catch (_) { return; }
   const name = data.site_name || "智能体平台";
   document.title = location.pathname.startsWith("/admin") ? `设置 - ${name}`
-    : location.pathname.startsWith("/login") ? `登录 - ${name}` : name;
+    : location.pathname.startsWith("/login") ? `登录 - ${name}`
+    : name;
   const titleEl = document.getElementById("brand-title");
   if (titleEl) {
     const logo = data.logo_url
@@ -390,9 +506,11 @@ function openChangePasswordDialog() {
 }
 
 async function logout() {
-  try { await fetch("/api/v1/auth/logout", {method: "POST"}); } catch (_) {}
-  Auth.clear();
-  location.href = "/login";
+  try {
+    await api("/api/v1/auth/logout", {method: "POST"});
+    Auth.clear();
+    location.href = "/login";
+  } catch (error) { showToast(`退出失败：${error.message}`); }
 }
 
 async function submitChangePassword() {

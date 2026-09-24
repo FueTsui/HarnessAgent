@@ -9,8 +9,9 @@ from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
-from backend import harness
+from backend import guardrail_policies, guardrails, harness
 from backend.approvals import ApprovalRequired
 from backend import approval_policy
 from backend.api.chat import _build_memory, _public_process_payload, resolve_agent_descriptor
@@ -560,6 +561,16 @@ class _FalseWebDenialLlm:
 
 
 class HarnessArchitectureTests(unittest.TestCase):
+    def setUp(self):
+        self._guardrail_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        Base.metadata.create_all(self._guardrail_engine)
+        self.addCleanup(self._guardrail_engine.dispose)
+        guardrail_sessions = sessionmaker(bind=self._guardrail_engine)
+        for module in (guardrails, guardrail_policies):
+            patcher = patch.object(module, "SessionLocal", guardrail_sessions)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_dynamic_evaluation_builds_public_evidence_tree_and_resolves_artifact(self):
         report = evaluate_execution(
             objective="生成并核验报告",

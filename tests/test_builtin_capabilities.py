@@ -15,8 +15,9 @@ from PIL import Image
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
-from backend import jobs, scheduler
+from backend import guardrail_policies, guardrails, jobs, scheduler
 from backend.database import Base
 from backend.models import Agent, Job, ScheduledTask, User
 from backend.runtime import task_store
@@ -150,6 +151,14 @@ def _image_pixels(image: Image.Image):
 
 class BuiltinCapabilityTests(unittest.TestCase):
     def setUp(self):
+        self._guardrail_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        Base.metadata.create_all(self._guardrail_engine)
+        self.addCleanup(self._guardrail_engine.dispose)
+        guardrail_sessions = sessionmaker(bind=self._guardrail_engine)
+        for module in (guardrails, guardrail_policies):
+            patcher = patch.object(module, "SessionLocal", guardrail_sessions)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         # Every test owns a real, already-created workspace. Do not depend on the
         # repository's ignored tmp/ directory existing on a fresh CI checkout.
         self._workspace = tempfile.TemporaryDirectory()

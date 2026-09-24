@@ -19,6 +19,11 @@ import httpx
 
 from ..config import settings
 from ..net_guard import validate_outbound_url
+from ..reasoning_options import (
+    canonical_reasoning_model_id, normalize_reasoning_config,
+    reasoning_capabilities, reasoning_profile_is_fixed,
+    reasoning_wire_settings, validate_reasoning_settings,
+)
 from .codex_models import (
     DEFAULT_CHATGPT_CODEX_MODEL,
     FALLBACK_CHATGPT_CODEX_MODELS,
@@ -38,6 +43,10 @@ _HARMONY_TOOL_CHANNEL_SUFFIX_RE = re.compile(
     r"<\|channel\|>(?:analysis|commentary|final)\s*$",
     re.IGNORECASE,
 )
+_DEEPSEEK_REASONING_MODELS = {
+    "deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp",
+}
+_HY_REASONING_MODELS = {"hy3", "hy4-preview"}
 
 
 def _normalize_tool_name(value) -> str:
@@ -92,6 +101,9 @@ def explain_http_error(exc: "httpx.HTTPStatusError") -> str:
         return "401 鉴权失败：API Key 无效/过期，或该 Key 无权访问此接口（注意区分 API Key 与 ChatGPT 登录令牌）" + tail
     if code == 404:
         return "404 未找到：模型名可能不存在或该账户无权访问，请核对文本模型名" + tail
+    if code == 410:
+        return ("410 模型或接口已下线：当前地址不再提供此资源，请重新识别可用模型并更新模型配置；"
+                "重复提交相同请求无法恢复" + tail)
     return f"{code} {resp.reason_phrase}{tail}"
 
 # 进程级共享 httpx 客户端（连接池复用，M2）：在运行的事件循环内惰性创建，shutdown 时关闭。
@@ -113,18 +125,20 @@ async def aclose_http_client() -> None:
     if _shared_client is not None and not _shared_client.is_closed:
         await _shared_client.aclose()
     _shared_client = None
+    from ..personal_network import aclose_personal_http_client
+    await aclose_personal_http_client()
 
 # 各提供商预设（前端新建时自动填充；模型通过通用模型配置选择）
 PROVIDER_PRESETS: dict[str, dict] = {
     "deepseek": {
         "label": "DeepSeek 官方",
         "base_url": "https://api.deepseek.com/v1",
-        "model_id": "deepseek-chat",
-        "model_name": "DeepSeek Chat",
-        "model_reasoning": False,
+        "model_id": "deepseek-flash",
+        "model_name": "DeepSeek Flash",
+        "model_reasoning": True,
         "model_input": ["text"],
         "key_hint": "sk-...（platform.deepseek.com 申请）",
-        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "models": ["deepseek-flash", "deepseek-v4-pro"],
     },
     "qwen": {
         "label": "通义千问（阿里云百炼）",
@@ -226,6 +240,7 @@ class LLMClient:
         stream_idle_timeout_ms: int = 300000,
         supports_temperature: bool = True,
         provider_id: int | None = None,
+        reasoning_config=None,
     ) -> None:
         self.base_url = (base_url or "").rstrip("/")
         self.provider_type = provider_type or "openai"
@@ -269,13 +284,18 @@ class LLMClient:
         self.context_tokens = context_window or settings.LLM_CONTEXT_TOKENS
         self.extra_body = dict(extra_body or {})
         self.reasoning_effort = reasoning_effort or ""
+        self.reasoning_config = normalize_reasoning_config(reasoning_config)
         self.max_output_tokens = max(1, int(max_tokens or 8192))
         self.max_tokens_param = max_tokens_param or "auto"
         self.timeout_ms = max(1000, int(timeout_ms or 120000))
         self.max_retries = max(0, int(max_retries or 0))
         self.stream_max_retries = max(0, int(stream_max_retries or 0))
         self.stream_idle_timeout_ms = max(1000, int(stream_idle_timeout_ms or self.timeout_ms))
-        self.supports_temperature = bool(supports_temperature)
+        # Official Kimi models fix sampling by thinking mode. Omission lets the
+        # service choose that value without rewriting saved provider settings.
+        self.supports_temperature = bool(supports_temperature) and canonical_reasoning_model_id(self.model_id) not in {
+            "kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6",
+        }
         self.provider_id = provider_id
         path = str(model_list_path or "/models").strip()
         self.model_list_path = path if path.startswith("/") else f"/{path}"
@@ -285,6 +305,10 @@ class LLMClient:
     def _url(self, path: str) -> str:
         return f"{self.base_url}/{path.lstrip('/')}"
 
+    def _http_client(self) -> httpx.AsyncClient:
+        """Allow restricted model connections to supply their own transport."""
+        return get_http_client()
+
     def _timeout(self, *, stream: bool = False) -> httpx.Timeout:
         total = self.timeout_ms / 1000
         read = self.stream_idle_timeout_ms / 1000 if stream else total
@@ -292,16 +316,15 @@ class LLMClient:
 
     def _body(self, payload: dict, protocol: str | None = None) -> dict:
         protocol = protocol or self.wire_api
-        body = {**self.extra_body, **payload}
+        body = copy.deepcopy({**self.extra_body, **payload})
+        if protocol == "chat_completions" and isinstance(body.get("messages"), list):
+            # Private protocol state may not cross to Chat Completions providers.
+            for message in body["messages"]:
+                if isinstance(message, dict):
+                    message.pop("_anthropic_content", None)
+                    message.pop("_responses_output", None)
         if not self.supports_temperature:
             body.pop("temperature", None)
-        if self.reasoning_effort:
-            if protocol == "responses":
-                body["reasoning"] = {"effort": self.reasoning_effort}
-            elif protocol == "messages":
-                body["effort"] = self.reasoning_effort
-            else:
-                body["reasoning_effort"] = self.reasoning_effort
         token_param = self.max_tokens_param
         if token_param == "auto":
             token_param = {
@@ -311,7 +334,119 @@ class LLMClient:
             }.get(protocol, "max_tokens")
         if token_param != "none":
             body.setdefault(token_param, self.max_output_tokens)
+        if reasoning_profile_is_fixed({"model_id": self.model_id, "reasoning_config": self.reasoning_config}):
+            # M2's legacy values are accepted but ineffective upstream. Preserve
+            # the saved connection while sending no fictitious control knobs.
+            self._remove_effort_fields(body)
+            body.pop("thinking", None)
+        elif self.reasoning_effort or self.reasoning_config.get("mode") in {"custom", "off"}:
+            self._apply_reasoning(body, protocol, self.reasoning_effort)
         return body
+
+    def _apply_reasoning(self, body: dict, protocol: str, effort: str) -> None:
+        provider = {
+            "model_id": self.model_id, "wire_api": protocol, "model_reasoning": True,
+            "reasoning_config": self.reasoning_config, "reasoning_effort": effort,
+            "max_tokens": self.max_output_tokens, "max_tokens_param": self.max_tokens_param,
+            "extra_body": body, "provider_type": self.provider_type, "base_url": self.base_url,
+        }
+        validate_reasoning_settings(provider)
+        control, param, budget = reasoning_wire_settings(provider)
+        if control == "off":
+            self._remove_effort_fields(body)
+            body.pop("thinking", None)
+            return
+        if not effort:
+            return
+        if self.reasoning_config.get("mode", "auto") == "auto":
+            model = canonical_reasoning_model_id(self.model_id)
+            if model == "minimax-m3":
+                # MiniMax's compatible effort values are an on/off control,
+                # never distinct strengths. M3 uses no thinking-token budget.
+                self._remove_effort_fields(body)
+                if protocol == "responses":
+                    body.pop("thinking", None)
+                    self._set_effort_field(body, "reasoning.effort", "minimal" if effort == "enabled" else "none")
+                else:
+                    thinking = body.get("thinking")
+                    thinking = dict(thinking) if isinstance(thinking, dict) else {}
+                    thinking["type"] = "adaptive" if effort == "enabled" else "disabled"
+                    thinking.pop("budget_tokens", None)
+                    if effort == "disabled":
+                        thinking.pop("display", None)
+                    body["thinking"] = thinking
+                return
+            if model in _DEEPSEEK_REASONING_MODELS | _HY_REASONING_MODELS:
+                if protocol == "messages":
+                    # These compatible Messages endpoints switch thinking with
+                    # its native toggle; output_config.effort=none is not used.
+                    self._remove_effort_fields(body)
+                    thinking = body.get("thinking")
+                    thinking = dict(thinking) if isinstance(thinking, dict) else {}
+                    thinking["type"] = "disabled" if effort == "none" else "enabled"
+                    thinking.pop("budget_tokens", None)
+                    if effort == "none":
+                        thinking.pop("display", None)
+                    body["thinking"] = thinking
+                    if effort != "none":
+                        self._set_effort_field(body, "output_config.effort", effort)
+                    return
+                # Explicit turn choices override a contradictory inherited
+                # toggle, while standard native effort fields remain unchanged.
+                if isinstance(body.get("thinking"), dict):
+                    if protocol == "responses":
+                        body.pop("thinking")
+                    else:
+                        body["thinking"]["type"] = "disabled" if effort == "none" else "enabled"
+        if control == "thinking_toggle" and effort in {"disabled", "enabled"}:
+            thinking = body.get("thinking")
+            thinking = dict(thinking) if isinstance(thinking, dict) else {}
+            thinking["type"] = effort
+            if protocol == "messages" and effort == "enabled":
+                thinking["budget_tokens"] = budget
+            elif effort == "disabled":
+                thinking.pop("budget_tokens", None)
+                thinking.pop("display", None)
+            body["thinking"] = thinking
+            return
+        self._set_effort_field(body, param, effort)
+
+    @staticmethod
+    def _set_effort_field(body: dict, param: str, effort: str) -> None:
+        if "." in param:
+            parent, key = param.split(".")
+            nested = body.get(parent)
+            nested = dict(nested) if isinstance(nested, dict) else {}
+            nested[key] = effort
+            body[parent] = nested
+        else:
+            body[param] = effort
+
+    @staticmethod
+    def _remove_effort_fields(body: dict) -> None:
+        body.pop("reasoning_effort", None)
+        body.pop("effort", None)
+        for key in ("reasoning", "output_config"):
+            if isinstance(body.get(key), dict):
+                body[key].pop("effort", None)
+                if not body[key]:
+                    body.pop(key)
+
+    def _apply_recovery_reasoning(self, body: dict, protocol: str) -> None:
+        # Recovery does not invent an unsupported value or override extra-body
+        # controls. Custom declarations and toggles retain provider defaults.
+        if self.reasoning_effort or self.reasoning_config:
+            return
+        if any(key in body for key in ("reasoning_effort", "reasoning", "output_config", "thinking")):
+            return
+        control, _, _ = reasoning_wire_settings({"model_id": self.model_id, "wire_api": protocol})
+        if control == "effort":
+            capabilities = reasoning_capabilities({
+                "model_id": self.model_id, "wire_api": protocol, "model_reasoning": True,
+            })
+            if capabilities["reasoning_supported"] and "low" not in capabilities["reasoning_efforts"]:
+                return
+            self._apply_reasoning(body, protocol, "low")
 
     @staticmethod
     def _upstream_error_text(exc: httpx.HTTPStatusError) -> str:
@@ -383,7 +518,7 @@ class LLMClient:
         compatibility_adjustments = 0
         while attempt <= retry_count:
             try:
-                response = await get_http_client().post(
+                response = await self._http_client().post(
                     self._url(path), json=payload,
                     headers=self.headers if headers is None else headers,
                     params=self.query_params, timeout=self._timeout(),
@@ -403,7 +538,7 @@ class LLMClient:
                 ):
                     compatibility_adjustments += 1
                     continue
-                if exc.response.status_code in (400, 401, 403, 404) or "insufficient_quota" in last_error:
+                if exc.response.status_code in (400, 401, 403, 404, 410) or "insufficient_quota" in last_error:
                     break
             except Exception as exc:  # noqa: BLE001
                 last_error = str(exc)
@@ -488,7 +623,8 @@ class LLMClient:
     def _force_final_answer_mode(self, payload: dict) -> None:
         """按模型能力关闭/压低推理，确保输出预算留给用户正文。"""
         model = (self.text_model or "").lower()
-        if self.wire_api != "chat_completions":
+        if (self.wire_api != "chat_completions" or self.reasoning_effort
+                or self.reasoning_config.get("mode") in {"off", "custom"}):
             return
         if "nemotron-3" in model:
             kwargs = payload.get("chat_template_kwargs")
@@ -497,7 +633,7 @@ class LLMClient:
             kwargs.pop("low_effort", None)
             payload["chat_template_kwargs"] = kwargs
             payload.pop("reasoning_budget", None)
-        elif "gpt-oss" in model:
+        elif "gpt-oss" in model and not self.reasoning_effort:
             payload["reasoning_effort"] = "low"
 
     async def _recover_empty_message(
@@ -523,8 +659,12 @@ class LLMClient:
             payload = self._responses_payload(recovery_messages)
             if self.supports_temperature:
                 payload["temperature"] = temperature
-            if reasoning_chars or "gpt-oss" in (self.text_model or "").lower():
-                payload["reasoning"] = {"effort": "low"}
+            # Recovery may choose a conservative default, but must preserve an
+            # explicit provider/turn effort (including the string "none").
+            if not self.reasoning_effort and (
+                reasoning_chars or "gpt-oss" in (self.text_model or "").lower()
+            ):
+                self._apply_recovery_reasoning(payload, "responses")
             parsed = self._parse_responses(
                 await self._request_json("/responses", payload, retries=0)
             )
@@ -532,8 +672,8 @@ class LLMClient:
             payload = self._anthropic_payload(recovery_messages)
             if self.supports_temperature:
                 payload["temperature"] = temperature
-            if reasoning_chars:
-                payload["effort"] = "low"
+            if reasoning_chars and not self.reasoning_effort:
+                self._apply_recovery_reasoning(payload, "messages")
             parsed = self._parse_anthropic(
                 await self._request_json("/messages", payload, retries=0)
             )
@@ -591,6 +731,12 @@ class LLMClient:
                     "output": str(message.get("content") or ""),
                 })
                 continue
+            private = message.get("_responses_output")
+            if (role == "assistant" and isinstance(private, dict)
+                    and private.get("origin") == self._responses_origin()
+                    and isinstance(private.get("items"), list)):
+                inputs.extend(copy.deepcopy(private["items"]))
+                continue
             content = message.get("content")
             if content:
                 inputs.append({"role": role, "content": self._responses_content(content)})
@@ -618,12 +764,12 @@ class LLMClient:
             payload["tool_choice"] = "auto"
         return self._body(payload, "responses")
 
-    @staticmethod
-    def _parse_responses(data: dict) -> dict:
+    def _responses_origin(self) -> list:
+        return [self.provider_id, self.base_url, self.model_id]
+
+    def _parse_responses(self, data: dict) -> dict:
         texts = []
         calls = []
-        if isinstance(data.get("output_text"), str):
-            texts.append(data["output_text"])
         for item in data.get("output") or []:
             if not isinstance(item, dict):
                 continue
@@ -639,9 +785,22 @@ class LLMClient:
             for block in item.get("content") or []:
                 if isinstance(block, dict) and block.get("type") in ("output_text", "text"):
                     texts.append(str(block.get("text") or ""))
-        return _normalize_assistant_message({
+        if not texts and isinstance(data.get("output_text"), str):
+            texts.append(data["output_text"])
+        message = {
             "role": "assistant", "content": "".join(texts), "tool_calls": calls,
-        })
+        }
+        if canonical_reasoning_model_id(self.model_id) in _DEEPSEEK_REASONING_MODELS:
+            # DeepSeek stateless tool requests require the previous reasoning
+            # items beside their assistant/function-call output. Keep exact
+            # ordering privately, bound to the original connection and model.
+            items = [copy.deepcopy(item) for item in data.get("output") or []
+                     if isinstance(item, dict) and item.get("type") in {
+                         "reasoning", "message", "function_call",
+                     }]
+            if items:
+                message["_responses_output"] = {"origin": self._responses_origin(), "items": items}
+        return _normalize_assistant_message(message)
 
     @staticmethod
     def _anthropic_image(block: dict) -> dict | None:
@@ -672,6 +831,12 @@ class LLMClient:
                         "content": str(message.get("content") or ""),
                     }],
                 })
+                continue
+            private = message.get("_anthropic_content")
+            if (role == "assistant" and isinstance(private, dict)
+                    and private.get("origin") == self._anthropic_origin()
+                    and isinstance(private.get("blocks"), list)):
+                converted.append({"role": "assistant", "content": copy.deepcopy(private["blocks"])})
                 continue
             blocks = []
             content = message.get("content")
@@ -714,8 +879,10 @@ class LLMClient:
             payload["tool_choice"] = {"type": "auto"}
         return self._body(payload, "messages")
 
-    @staticmethod
-    def _parse_anthropic(data: dict) -> dict:
+    def _anthropic_origin(self) -> list:
+        return [self.provider_id, self.base_url, self.model_id]
+
+    def _parse_anthropic(self, data: dict) -> dict:
         texts = []
         calls = []
         for block in data.get("content") or []:
@@ -734,6 +901,8 @@ class LLMClient:
                 })
         return _normalize_assistant_message({
             "role": "assistant", "content": "".join(texts), "tool_calls": calls,
+            "_anthropic_content": {"origin": self._anthropic_origin(),
+                                   "blocks": copy.deepcopy(data.get("content") or [])},
         })
 
     async def chat_with_tools(
@@ -852,7 +1021,8 @@ class LLMClient:
 
             GPT-OSS 等推理模型可能在输出预算内只产生 ``reasoning_content``，
             正文 ``content`` 始终为空。对这种已正常结束的 SSE 重放相同请求没有
-            意义，因此用低推理强度和明确的最终答复指令做一次非流式恢复。
+            意义，因此用明确的最终答复指令做一次非流式恢复；仅在没有显式
+            推理档位时使用低推理强度。
             推理文本只用于判定，不返回给用户。
             """
             recovery = copy.deepcopy(payload)
@@ -876,13 +1046,13 @@ class LLMClient:
                     {"role": "system", "content": instruction},
                 ]
             model_name = (self.text_model or "").lower()
-            if reasoning_chars or "gpt-oss" in model_name:
+            if not self.reasoning_effort and (reasoning_chars or "gpt-oss" in model_name):
                 if self.wire_api == "responses":
-                    recovery["reasoning"] = {"effort": "low"}
+                    self._apply_recovery_reasoning(recovery, "responses")
                 elif self.wire_api == "messages":
-                    recovery["effort"] = "low"
+                    self._apply_recovery_reasoning(recovery, "messages")
                 elif "gpt-oss" in model_name:
-                    recovery["reasoning_effort"] = "low"
+                    self._apply_recovery_reasoning(recovery, "chat_completions")
             self._force_final_answer_mode(recovery)
             try:
                 data = await self._request_json(path, recovery, retries=0)
@@ -919,7 +1089,7 @@ class LLMClient:
             finish_reason = ""
             usage_values: dict[str, int] = {}
             try:
-                async with get_http_client().stream(
+                async with self._http_client().stream(
                     "POST", url, json=payload, headers=self.headers,
                     params=self.query_params, timeout=self._timeout(stream=True),
                 ) as resp:
@@ -1044,7 +1214,7 @@ class LLMClient:
                 ):
                     compatibility_adjustments += 1
                     continue
-                if emitted or exc.response.status_code in (401, 403):
+                if emitted or exc.response.status_code in (401, 403, 410):
                     break
             except Exception as exc:  # noqa: BLE001
                 last_error = str(exc)
@@ -1135,7 +1305,7 @@ class LLMClient:
         params = dict(self.query_params or {})
         if self.wire_api == "messages":
             params.setdefault("limit", 1000)
-        resp = await get_http_client().get(
+        resp = await self._http_client().get(
             self._url(self.model_list_path), headers=self.headers,
             params=params or None, timeout=self._timeout(),
         )
@@ -1215,4 +1385,5 @@ def client_for_provider(provider):
         supports_temperature=getattr(provider, "supports_temperature", True),
         # 保存前识别模型时 provider 是没有数据库 id 的临时对象。
         provider_id=getattr(provider, "id", None),
+        reasoning_config=getattr(provider, "reasoning_config", None),
     )

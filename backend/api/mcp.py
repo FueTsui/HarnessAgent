@@ -6,6 +6,8 @@
 """
 import json
 import hashlib
+import re
+from pydantic import ValidationError
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
@@ -32,7 +34,56 @@ def _mcp_version_snapshot(s: McpServer, catalog_hash: str = "") -> dict:
         "enabled": bool(s.enabled),
         "is_public": bool(s.is_public),
         "catalog_hash": catalog_hash,
+        "connection_sha256": hashlib.sha256(json.dumps({
+            "url": s.url, "headers": s.headers,
+            "command": getattr(s, "command", ""), "args": getattr(s, "args", "[]"),
+            "env": getattr(s, "env", "{}"), "cwd": getattr(s, "cwd", ""),
+        }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest(),
     }
+
+
+def _require_stdio_root(user: User):
+    if user.role != "root":
+        raise HTTPException(403, "stdio 会在服务器启动本地程序，仅 root 可创建、修改或探测其启动配置；其他角色可使用 root 已共享的已授权服务")
+
+
+def _stdio_values(source):
+    return {
+        "command": str(getattr(source, "command", "") or ""),
+        "args": mcp_client._json_field(getattr(source, "args", []), list, []),
+        "env": mcp_client._json_field(getattr(source, "env", {}), dict, {}),
+        "cwd": str(getattr(source, "cwd", "") or ""),
+    }
+
+
+def _validate_connection(values: dict):
+    if values["transport"] == "stdio":
+        try:
+            mcp_client.validate_stdio_config(values["command"], values["args"], values["env"], values["cwd"])
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    elif not str(values.get("url") or "").strip():
+        raise HTTPException(422, "HTTP/SSE 连接必须填写服务地址")
+
+
+def _safe_export_args(args: list[str]) -> list[str]:
+    """Exports carry the launch shape without inline credential flag values."""
+    result, hide_next = [], False
+    for value in args:
+        if hide_next:
+            result.append("${MCP_SECRET}")
+            hide_next = False
+        elif mcp_client._SENSITIVE_ARGUMENT_RE.search(value):
+            if re.match(r"^-{1,2}[A-Za-z][A-Za-z0-9_-]*=", value):
+                result.append(value.split("=", 1)[0] + "=${MCP_SECRET}")
+            elif re.fullmatch(r"-{1,2}[A-Za-z][A-Za-z0-9_-]*", value):
+                result.append(value)
+                hide_next = True
+            else:
+                result.append("${MCP_SECRET}")
+        else:
+            result.append(value)
+    return result
 
 
 def _to_out(s: McpServer, user: User | None = None, db: Session | None = None) -> McpServerOut:
@@ -41,17 +92,25 @@ def _to_out(s: McpServer, user: User | None = None, db: Session | None = None) -
     except json.JSONDecodeError:
         headers = {}
     manageable = True if user is None else can_manage(user, s)
+    if s.transport == "stdio" and user is not None and user.role != "root":
+        manageable = False
     if not manageable:
         # 公开 MCP 可被其它管理员挂载使用，但不能读取其鉴权头。
         headers = {str(key): "********" for key in headers}
     lifecycle = public_lifecycle(db, "mcp", s.id) if db is not None else {}
     governance = resource_state(db, "mcp", s.id) if db is not None else {}
+    launch = _stdio_values(s)
     return McpServerOut(
         id=s.id, name=s.name, description=s.description, transport=s.transport,
         url=s.url, headers=headers if isinstance(headers, dict) else {}, enabled=s.enabled,
         risk_policy=str(getattr(s, "risk_policy", "auto") or "auto"),
         is_public=bool(getattr(s, "is_public", False)),
         can_manage=manageable,
+        command=launch["command"] if manageable else "",
+        args=launch["args"] if manageable else [],
+        env={key: "********" if value else "" for key, value in launch["env"].items()},
+        cwd=launch["cwd"] if manageable else "",
+        stdio_authorized=bool(getattr(s, "stdio_authorized", False)),
         catalog_hash=str(governance.get("catalog_hash") or ""),
         review_required=bool(governance.get("review_required")),
         **lifecycle,
@@ -68,12 +127,18 @@ def list_servers(admin: User = Depends(require_module("mcp")), db: Session = Dep
 def create_server(
     body: McpServerCreate, admin: User = Depends(require_module("mcp")), db: Session = Depends(get_db)
 ):
+    if body.transport == "stdio" or body.command or body.args or body.env or body.cwd:
+        _require_stdio_root(admin)
+    _validate_connection(body.model_dump())
     if db.query(McpServer).filter(McpServer.name == body.name).first():
         raise HTTPException(status.HTTP_409_CONFLICT, "MCP 服务名称已存在")
     server = McpServer(
         name=body.name, description=body.description, transport=body.transport,
         url=body.url.rstrip("/") if body.transport == "http" else body.url,
         headers=json.dumps(body.headers, ensure_ascii=False),
+        command=body.command, args=json.dumps(body.args, ensure_ascii=False),
+        env=json.dumps(body.env, ensure_ascii=False), cwd=body.cwd,
+        stdio_authorized=body.transport == "stdio" and admin.role == "root",
         risk_policy=body.risk_policy,
         enabled=body.enabled, created_by=admin.id,
     )
@@ -92,7 +157,27 @@ def update_server(
     server = db.get(McpServer, server_id)
     if server is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "MCP 服务不存在")
+    launch = _stdio_values(server)
+    changed = body.model_dump(exclude_unset=True)
+    launch_changed = any(changed.get(key) is not None and changed[key] != launch[key] for key in ("command", "args", "env", "cwd"))
+    if server.transport == "stdio" or body.transport == "stdio" or launch_changed:
+        _require_stdio_root(admin)
     require_owner(admin, server)
+    for key in ("command", "args", "cwd"):
+        if changed.get(key) is not None:
+            launch[key] = changed[key]
+    if body.env is not None:
+        prior_env = launch["env"]
+        launch["env"] = {}
+        for key, value in body.env.items():
+            if value == "********":
+                if key not in prior_env:
+                    raise HTTPException(422, "新环境变量不能使用脱敏占位值，请填写值或环境变量引用")
+                launch["env"][key] = prior_env[key]
+            else:
+                launch["env"][key] = value
+    transport = body.transport or server.transport
+    _validate_connection({**launch, "transport": transport, "url": body.url if body.url is not None else server.url})
     if body.name and body.name != server.name:
         if db.query(McpServer).filter(McpServer.name == body.name).first():
             raise HTTPException(status.HTTP_409_CONFLICT, "MCP 服务名称已存在")
@@ -111,6 +196,11 @@ def update_server(
         server.enabled = body.enabled
     if body.is_public is not None:
         server.is_public = body.is_public
+    server.command = launch["command"]
+    server.args = json.dumps(launch["args"], ensure_ascii=False)
+    server.env = json.dumps(launch["env"], ensure_ascii=False)
+    server.cwd = launch["cwd"]
+    server.stdio_authorized = transport == "stdio" and admin.role == "root"
     state = resource_state(db, "mcp", server.id)
     record_version(db, "mcp", server.id, _mcp_version_snapshot(server, str(state.get("catalog_hash") or "")), actor_id=admin.id, change="updated")
     db.commit()
@@ -150,10 +240,12 @@ def delete_server(server_id: int, admin: User = Depends(require_module("mcp")), 
 
 # ---------- 导入 / 导出（JSON） ----------
 
-def _mcp_dict(s: McpServer) -> dict:
-    out = _to_out(s)
+def _mcp_dict(s: McpServer, user: User | None = None) -> dict:
+    out = _to_out(s, user)
     return {"name": out.name, "description": out.description, "transport": out.transport,
             "url": out.url, "headers": {}, "risk_policy": out.risk_policy,
+            "command": out.command, "args": _safe_export_args(out.args),
+            "env": {key: "" for key in out.env}, "cwd": out.cwd,
             "enabled": out.enabled}
 
 
@@ -190,7 +282,7 @@ def export_servers(
     selected = _parse_ids_optional(ids)
     if selected:
         q = q.filter(McpServer.id.in_(selected))
-    return [_mcp_dict(s) for s in q.order_by(McpServer.id).all()]
+    return [_mcp_dict(s, admin) for s in q.order_by(McpServer.id).all()]
 
 
 @router.post("/import", status_code=status.HTTP_201_CREATED)
@@ -205,24 +297,34 @@ async def import_servers(
         data = json.loads(raw.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"解析失败：{exc}")
-    items = data if isinstance(data, list) else [data]
-    created = []
+    if isinstance(data, dict) and isinstance(data.get("mcpServers"), dict):
+        items = [{**value, "name": name} for name, value in data["mcpServers"].items() if isinstance(value, dict)]
+    else:
+        items = data if isinstance(data, list) else [data]
+    prepared = []
     for d in items:
         if not isinstance(d, dict):
-            continue
-        name = str(d.get("name") or "").strip()
-        url = str(d.get("url") or "").strip()
-        if not name or not url:
-            continue
-        transport = d.get("transport") if d.get("transport") in ("http", "sse") else "http"
-        headers = d.get("headers") if isinstance(d.get("headers"), dict) else {}
-        risk_policy = d.get("risk_policy") if d.get("risk_policy") in ("auto", "read_only") else "auto"
+            raise HTTPException(422, "每个 MCP 导入项必须是配置对象")
+        if not d.get("transport"):
+            d = {**d, "transport": "stdio" if d.get("command") else "http"}
+        try:
+            body = McpServerCreate.model_validate(d)
+        except ValidationError as exc:
+            raise HTTPException(422, "MCP 导入配置无效，请检查名称、传输协议与字段类型") from exc
+        if body.transport == "stdio" or body.command or body.args or body.env or body.cwd:
+            _require_stdio_root(admin)
+        _validate_connection(body.model_dump())
+        prepared.append(body)
+    created = []
+    for body in prepared:
         srv = McpServer(
-            name=_unique_mcp_name(db, name), description=str(d.get("description") or ""),
-            transport=transport, url=url.rstrip("/") if transport == "http" else url,
-            headers=json.dumps(headers, ensure_ascii=False),
-            risk_policy=risk_policy,
-            enabled=bool(d.get("enabled", True)), created_by=admin.id,
+            name=_unique_mcp_name(db, body.name), description=body.description,
+            transport=body.transport, url=body.url.rstrip("/") if body.transport == "http" else body.url,
+            headers=json.dumps(body.headers, ensure_ascii=False), risk_policy=body.risk_policy,
+            command=body.command, args=json.dumps(body.args, ensure_ascii=False),
+            env=json.dumps(body.env, ensure_ascii=False), cwd=body.cwd,
+            stdio_authorized=body.transport == "stdio" and admin.role == "root",
+            enabled=body.enabled, created_by=admin.id,
         )
         db.add(srv)
         db.flush()
@@ -238,6 +340,8 @@ async def test_server(server_id: int, admin: User = Depends(require_module("mcp"
     server = db.get(McpServer, server_id)
     if server is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "MCP 服务不存在")
+    if server.transport == "stdio":
+        _require_stdio_root(admin)
     require_owner(admin, server)
     try:
         tools = await mcp_client.list_tools(server)

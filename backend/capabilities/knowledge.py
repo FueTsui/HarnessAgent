@@ -1,9 +1,6 @@
 """本地知识库能力：文档管理、索引与检索。
 
-原 Dify 知识库（dataset_ids 为实例加密 ID）无法导出，这里改为本地文件夹方案：
-  data/knowledge/green/  绿色低碳、零碳园区政策与标准文档
-  data/knowledge/vpp/    VPP、售电、投运测算资料文档
-  data/knowledge/<key>/  自定义知识库
+知识库由用户创建，文档保存在 data/knowledge/<key>/。
 
 检索算法：BM25 关键词相关度 + 本地概念扩展/字符子词近似语义，取 top_k 段落。
 知识库为空时返回空串，提示词中已有「知识库未命中需复核政策」的兜底规则。
@@ -25,14 +22,8 @@ TOP_K = 5
 SCORE_THRESHOLD = 0.08
 CHUNK_SIZE = 600
 DATASETS_META = KNOWLEDGE_DIR / "_datasets.json"
-# root 删除内置知识库后在此登记，避免 _load_datasets 自动重建
-DELETED_BUILTINS_META = KNOWLEDGE_DIR / "_deleted_builtins.json"
 META_LOCK_FILE = KNOWLEDGE_DIR / ".datasets.lock"
 _THREAD_META_LOCK = threading.RLock()
-DEFAULT_DATASETS = {
-    "green": {"name": "绿色低碳知识库", "created_by": None, "builtin": True, "is_public": False},
-    "vpp": {"name": "VPP与投运知识库", "created_by": None, "builtin": True, "is_public": False},
-}
 TEXT_SUFFIXES = {".md", ".txt"}
 UPLOAD_SUFFIXES = TEXT_SUFFIXES | {".docx"}
 
@@ -113,7 +104,7 @@ def _atomic_json_write(path: Path, value) -> None:
 
 
 def _load_datasets_unlocked() -> dict[str, dict]:
-    """返回 key -> 元数据，并确保内置知识库始终存在。"""
+    """返回用户创建的知识库元数据，不预置或自动恢复知识库。"""
     data: dict[str, dict] = {}
     if DATASETS_META.exists():
         try:
@@ -126,20 +117,9 @@ def _load_datasets_unlocked() -> dict[str, dict]:
                 }
         except (OSError, json.JSONDecodeError):
             data = {}
-    changed = False
-    deleted_builtins = _load_deleted_builtins_unlocked()
-    for key, meta in DEFAULT_DATASETS.items():
-        if key in deleted_builtins:
-            continue  # root 已删除该内置知识库，不再重建
-        if key not in data:
-            data[key] = dict(meta)
-            changed = True
-        elif data[key].get("builtin") is not True:
-            data[key]["builtin"] = True
-            changed = True
     for key in data:
         (KNOWLEDGE_DIR / key).mkdir(parents=True, exist_ok=True)
-    if changed or not DATASETS_META.exists():
+    if not DATASETS_META.exists():
         _save_datasets_unlocked(data)
     return data
 
@@ -157,33 +137,6 @@ def _save_datasets_unlocked(data: dict[str, dict]) -> None:
 def _save_datasets(data: dict[str, dict]) -> None:
     with _locked_meta():
         _save_datasets_unlocked(data)
-
-
-def _load_deleted_builtins_unlocked() -> set[str]:
-    """读取已被 root 删除的内置知识库 key 列表。"""
-    if DELETED_BUILTINS_META.exists():
-        try:
-            raw = json.loads(DELETED_BUILTINS_META.read_text(encoding="utf-8"))
-            if isinstance(raw, list):
-                return {str(k) for k in raw if k}
-        except (OSError, json.JSONDecodeError):
-            pass
-    return set()
-
-
-def _load_deleted_builtins() -> set[str]:
-    with _locked_meta():
-        return _load_deleted_builtins_unlocked()
-
-
-def _save_deleted_builtins_unlocked(keys: set[str]) -> None:
-    KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
-    _atomic_json_write(DELETED_BUILTINS_META, sorted(keys))
-
-
-def _save_deleted_builtins(keys: set[str]) -> None:
-    with _locked_meta():
-        _save_deleted_builtins_unlocked(keys)
 
 
 def _dataset_exists(dataset: str) -> bool:
@@ -505,11 +458,6 @@ def delete_dataset(dataset: str, user) -> bool:
         shutil.rmtree(KNOWLEDGE_DIR / dataset, ignore_errors=True)
         del datasets[dataset]
         _save_datasets_unlocked(datasets)
-        # 内置知识库登记墓碑，防止 _load_datasets 再次重建
-        if dataset in DEFAULT_DATASETS:
-            deleted = _load_deleted_builtins_unlocked()
-            deleted.add(dataset)
-            _save_deleted_builtins_unlocked(deleted)
     return True
 
 

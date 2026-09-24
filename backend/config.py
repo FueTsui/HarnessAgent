@@ -3,6 +3,23 @@ import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _load_dotenv() -> None:
+    # 独立本地程序显式选择用户配置；源码启动仍沿用项目 .env。
+    env_file = Path(os.getenv("APP_ENV_FILE") or (BASE_DIR / ".env"))
+    if not env_file.exists():
+        return
+    for line in env_file.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+_load_dotenv()
+
 # 数据根目录可经 APP_DATA_DIR 覆盖（默认 <repo>/data）。测试/多实例部署据此隔离落盘数据
 # （Logo、导出件、知识库、SQLite 库等），避免冒烟测试等进程污染或清除生产数据目录。
 DATA_DIR = Path(os.getenv("APP_DATA_DIR") or (BASE_DIR / "data")).resolve()
@@ -36,21 +53,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _load_dotenv() -> None:
-    env_file = BASE_DIR / ".env"
-    if not env_file.exists():
-        return
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip())
-
-
-_load_dotenv()
-
-
 class Settings:
     # 服务
     APP_ENV: str = os.getenv("APP_ENV", "development").strip().lower()
@@ -71,6 +73,8 @@ class Settings:
     JWT_EXPIRE_MINUTES: int = int(os.getenv("JWT_EXPIRE_MINUTES", "720"))
     AUTH_COOKIE_NAME: str = os.getenv("AUTH_COOKIE_NAME", "gca_session")
     AUTH_COOKIE_SECURE: bool = _env_bool("AUTH_COOKIE_SECURE", False)
+    # Browser cookie is session-only; the server also enforces this absolute TTL.
+    AUTH_SESSION_EXPIRE_MINUTES: int = int(os.getenv("AUTH_SESSION_EXPIRE_MINUTES", "720"))
     # 数据库凭据信封加密主密钥。生产建议与 JWT_SECRET 分离。
     SECRET_MASTER_KEY: str = os.getenv("SECRET_MASTER_KEY", "")
     SECRET_MASTER_KEY_PREVIOUS: str = os.getenv("SECRET_MASTER_KEY_PREVIOUS", "")
@@ -241,5 +245,5 @@ def security_config_warnings() -> list[str]:
         warnings.append("SQLite 仅适合单机部署；多副本应使用共享数据库")
     return warnings
 
-for _d in (DATA_DIR, UPLOAD_DIR, EXPORT_DIR, KNOWLEDGE_DIR / "green", KNOWLEDGE_DIR / "vpp", TEMPLATES_DIR, SKILLS_DIR, BRANDING_DIR, WORKSPACE_DIR):
+for _d in (DATA_DIR, UPLOAD_DIR, EXPORT_DIR, KNOWLEDGE_DIR, TEMPLATES_DIR, SKILLS_DIR, BRANDING_DIR, WORKSPACE_DIR):
     _d.mkdir(parents=True, exist_ok=True)

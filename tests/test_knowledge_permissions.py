@@ -15,9 +15,7 @@ class KnowledgePermissionTests(unittest.TestCase):
         self.patches = [
             patch.object(knowledge, "KNOWLEDGE_DIR", root),
             patch.object(knowledge, "DATASETS_META", root / "_datasets.json"),
-            patch.object(knowledge, "DELETED_BUILTINS_META", root / "_deleted_builtins.json"),
             patch.object(knowledge, "META_LOCK_FILE", root / ".datasets.lock"),
-            patch.object(knowledge, "DEFAULT_DATASETS", {}),
         ]
         for item in self.patches:
             item.start()

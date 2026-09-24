@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Harness Agent</title>
+  <link rel="stylesheet" href="splash.css">
+  <script defer src="splash.js"></script>
+</head>
+<body>
+  <header class="titlebar"><img class="app-logo" src="brand.png" alt=""><span>Harness Agent</span><span class="title-detail">本地工作区</span></header>
+  <main>
+    <div class="brand" aria-hidden="true"><img src="brand.png" alt=""></div>
+    <p class="eyebrow">你的本地 Agent 工作区</p>
+    <h1 id="heading">正在准备工作区</h1>
+    <p class="message" id="message">正在启动本地服务与任务运行环境</p>
+    <div class="progress" id="progress" role="status" aria-label="正在启动"><span></span><span></span><span></span></div>
+    <div class="actions" id="actions" hidden>
+      <button class="primary" id="retry">重新启动</button>
+      <button id="logs">查看日志</button>
+      <button class="text-button" id="data">打开数据目录</button>
+    </div>
+  </main>
+  <footer><span class="local-dot" aria-hidden="true"></span><span id="footer-note">服务与数据保存在此电脑</span></footer>
+</body>
+</html>

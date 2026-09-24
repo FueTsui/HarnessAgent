@@ -1,6 +1,8 @@
 """低能力模型的确定性控制层：工具路由、参数修复、失败分析和完成验证。"""
+import ast
 from dataclasses import dataclass
 import json
+import math
 import re
 from typing import Any
 
@@ -66,11 +68,11 @@ _DOCUMENT_CREATE_INTENT = re.compile(
     re.IGNORECASE,
 )
 _PRESENTATION_CREATE_INTENT = re.compile(
-    r"(?:生成|创建|新建|导出|制作|设计|输出|整理为|套用|使用).{0,32}"
+    r"(?:生成|创建|新建|导出|制作|重制|重建|重做|设计|输出|整理为|套用|使用).{0,32}"
     r"(?:PPTX?|PowerPoint|演示稿|演示文稿|幻灯片)|"
     r"(?:PPTX?|PowerPoint|演示稿|演示文稿|幻灯片).{0,32}"
-    r"(?:生成|创建|新建|导出|制作|设计|输出|套用)|"
-    r"(?:create|generate|build|export|make).{0,40}(?:pptx?|powerpoint|presentation|slides?)",
+    r"(?:生成|创建|新建|导出|制作|重制|重建|重做|设计|输出|套用)|"
+    r"(?:create|recreate|generate|build|rebuild|export|make).{0,40}(?:pptx?|powerpoint|presentation|slides?)",
     re.IGNORECASE,
 )
 FALSE_WEB_DENIAL_ISSUE = "已经取得联网证据，但答复仍错误声称无法访问外部数据"
@@ -99,7 +101,26 @@ def _mandatory_tool_names(context: str) -> set[str]:
         names.add("document_format")
     if requires_document_artifact(context):
         names.add("document_create")
+    if requires_presentation_artifact(context):
+        names.add("presentation_create")
     return names
+
+
+def resolve_task_objective(query: str, history=None) -> str:
+    """Only explicit short continuations inherit the latest substantive user goal."""
+    continuation = re.compile(
+        r"^(?:请)?(?:重试|继续|重新执行|再试一次|retry|continue)"
+        r"(?:上面|上一轮|之前|刚才|这个|该)?(?:的)?(?:任务)?[。！!\s]*$", re.I
+    )
+    if not continuation.fullmatch((query or "").strip()):
+        return query
+    for item in reversed(history or []):
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        content = item.get("content")
+        if isinstance(content, str) and content.strip() and not continuation.fullmatch(content.strip()):
+            return content + "\n\n本轮请求：" + query
+    return query
 
 
 def requires_document_artifact(context: str) -> bool:
@@ -166,14 +187,172 @@ def canonical_tool_name(value: str, available_names: set[str]) -> str:
     name = str(value or "").strip()
     if name in available_names:
         return name
-    lowered = {item.lower(): item for item in available_names}
     for suffix in ("analysis", "commentary", "final"):
         if name.lower().endswith(suffix):
             candidate = name[:-len(suffix)].rstrip(" _:-")
-            resolved = lowered.get(candidate.lower())
-            if resolved:
-                return resolved
+            matches = [item for item in available_names if item.lower() == candidate.lower()]
+            if len(matches) == 1:
+                return matches[0]
     return name
+
+
+@dataclass(frozen=True)
+class ToolCallRepairResult:
+    """Protocol repair only; callers must still apply schema and execution policy checks."""
+
+    name: str
+    arguments: Any
+    repaired: bool = False
+    error: str | None = None
+
+
+_TOOL_CALL_MAX_CHARS = 16_384
+_TOOL_CALL_MAX_NODES = 2_048
+_TOOL_CALL_MAX_DEPTH = 32
+_TOOL_CALL_XML_ENDINGS = ("</parameter>", "</parameter")
+_TOOL_CALL_CHANNEL_ENDING = re.compile(
+    r"<\|channel\|>(?:analysis|commentary|final)\s*$", re.IGNORECASE,
+)
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate object key")
+        result[key] = value
+    return result
+
+
+def _checked_tool_literal(value: Any) -> str:
+    """Bound nesting and size, reject non-JSON literals, and compare without bool/int coercion."""
+    pending = [(value, 0)]
+    count = 0
+    characters = 0
+    while pending:
+        item, depth = pending.pop()
+        count += 1
+        if count > _TOOL_CALL_MAX_NODES or depth > _TOOL_CALL_MAX_DEPTH:
+            raise ValueError("literal too complex")
+        if type(item) is dict:
+            if len(item) > _TOOL_CALL_MAX_NODES:
+                raise ValueError("literal too complex")
+            for key, child in item.items():
+                if type(key) is not str:
+                    raise ValueError("object keys must be strings")
+                characters += len(key)
+                pending.append((child, depth + 1))
+        elif type(item) is list:
+            if len(item) > _TOOL_CALL_MAX_NODES:
+                raise ValueError("literal too complex")
+            pending.extend((child, depth + 1) for child in item)
+        elif type(item) is str:
+            characters += len(item)
+        elif type(item) is float:
+            if not math.isfinite(item):
+                raise ValueError("non-finite number")
+        elif type(item) is int:
+            if item.bit_length() > _TOOL_CALL_MAX_CHARS:
+                raise ValueError("number too large")
+        elif item is not None and type(item) is not bool:
+            raise ValueError("unsupported literal")
+        if characters > _TOOL_CALL_MAX_CHARS:
+            raise ValueError("literal too long")
+    serialized = json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True)
+    if len(serialized) > _TOOL_CALL_MAX_CHARS:
+        raise ValueError("literal too long")
+    return serialized
+
+
+def repair_tool_call(function: dict, available_names: set[str]) -> ToolCallRepairResult:
+    """Recover a single authorized function call accidentally emitted in its name.
+
+    A normal authorized name keeps its original arguments for the existing schema
+    pipeline. Embedded calls accept keyword-only JSON-compatible Python literals;
+    there is no evaluation, alias inference or merging of conflicting argument
+    sources. On ``error`` callers must reject execution and ask the model to emit
+    a bare function name plus a JSON arguments object. Diagnostics contain no raw
+    model text or parameter values.
+    """
+    if not isinstance(function, dict):
+        return ToolCallRepairResult("", {}, error="工具调用必须包含 function 对象。")
+    raw_name = function.get("name")
+    arguments = function.get("arguments", {})
+
+    def invalid(reason: str) -> ToolCallRepairResult:
+        return ToolCallRepairResult(
+            "", {}, error=reason + " 请使用已提供的纯工具名，并在 arguments 中提供 JSON 对象。",
+        )
+
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        return invalid("工具名缺失或格式无效。")
+    if len(raw_name) > _TOOL_CALL_MAX_CHARS:
+        return invalid("工具调用格式超出安全解析上限。")
+    # Exact offered names take precedence, including a tool legitimately ending
+    # in 'analysis'. Explicit Harmony markers retain the client compatibility.
+    name = raw_name.strip()
+    if name in available_names:
+        return ToolCallRepairResult(name, arguments, repaired=name != raw_name)
+    normalized = _TOOL_CALL_CHANNEL_ENDING.sub("", name).strip()
+    resolved = canonical_tool_name(normalized, available_names)
+    if resolved in available_names:
+        return ToolCallRepairResult(resolved, arguments, repaired=resolved != raw_name)
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", normalized):
+        # A well-formed but unavailable name belongs to the catalog's existing
+        # tool_unavailable rejection path. Only recovery of embedded calls needs
+        # an authorized mapping here; this result never grants execution rights.
+        return ToolCallRepairResult(normalized, arguments, repaired=normalized != raw_name)
+    for ending in _TOOL_CALL_XML_ENDINGS:
+        if normalized.endswith(ending):
+            normalized = normalized[:-len(ending)].rstrip()
+            break
+    try:
+        parsed = ast.parse(normalized, mode="eval")
+        pending = [(parsed, 0)]
+        count = 0
+        while pending:
+            node, depth = pending.pop()
+            count += 1
+            if count > _TOOL_CALL_MAX_NODES or depth > _TOOL_CALL_MAX_DEPTH:
+                raise ValueError("call too complex")
+            # literal_eval does not run code. This earlier check also prevents
+            # silently losing duplicate dictionary keys during literal parsing.
+            if isinstance(node, ast.Dict):
+                keys = []
+                for key in node.keys:
+                    if not isinstance(key, ast.Constant) or type(key.value) is not str:
+                        raise ValueError("object keys must be literal strings")
+                    keys.append(key.value)
+                if len(keys) != len(set(keys)):
+                    raise ValueError("duplicate object key")
+            pending.extend((child, depth + 1) for child in ast.iter_child_nodes(node))
+        call = parsed.body
+        if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name) or call.args:
+            raise ValueError("expected one keyword-only function call")
+        resolved = canonical_tool_name(call.func.id, available_names)
+        if resolved not in available_names:
+            return invalid("工具名无法唯一匹配到已提供的工具。")
+        embedded = {}
+        for keyword in call.keywords:
+            if keyword.arg is None or keyword.arg in embedded:
+                raise ValueError("duplicate or expanded keyword")
+            embedded[keyword.arg] = ast.literal_eval(keyword.value)
+        embedded_json = _checked_tool_literal(embedded)
+        supplied = arguments
+        if supplied is None or (isinstance(supplied, str) and not supplied.strip()):
+            supplied = {}
+        elif isinstance(supplied, str):
+            if len(supplied) > _TOOL_CALL_MAX_CHARS:
+                raise ValueError("arguments too long")
+            supplied = json.loads(supplied, object_pairs_hook=_unique_json_object)
+        if type(supplied) is not dict:
+            raise ValueError("arguments must be an object")
+        supplied_json = _checked_tool_literal(supplied)
+        if supplied and embedded and supplied_json != embedded_json:
+            return invalid("工具名内参数与 arguments 不一致，不能安全合并。")
+        return ToolCallRepairResult(resolved, embedded or supplied, repaired=True)
+    except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError, OverflowError):
+        return invalid("无法安全解析工具调用，仅支持单次调用和 JSON 兼容的字面量关键字参数。")
 
 
 def _tokens(text: str) -> set[str]:
@@ -184,7 +363,8 @@ def _tokens(text: str) -> set[str]:
     return result
 
 
-def route_tools(tools: list[dict], context: str, *, threshold: int, limit: int) -> list[dict]:
+def route_tools(tools: list[dict], context: str, *, threshold: int, limit: int,
+                preferred_names: set[str] | None = None) -> list[dict]:
     """从大工具目录中确定性选出少量候选；小目录保持原样。
 
     分数只依赖当前目标、近期观察和工具 Schema，可复现且不额外消耗一次模型调用。
@@ -194,6 +374,7 @@ def route_tools(tools: list[dict], context: str, *, threshold: int, limit: int) 
         return list(tools)
     wanted = _tokens(context)
     required_names = _mandatory_tool_names(context)
+    preferred_names = preferred_names or set()
     # 时效性外部问题先进入窄 Web 工具簇，避免弱模型被目录/Git 工具的高频词吸引。
     # 当用户同时明确要求处理工作区时保留通用评分结果，支持“检索后写入文件”等复合任务。
     if "web_search" in required_names and not _LOCAL_WORKSPACE_INTENT.search(context or ""):
@@ -202,7 +383,7 @@ def route_tools(tools: list[dict], context: str, *, threshold: int, limit: int) 
             if str((tool.get("function") or {}).get("name") or "")
             in {"web_search", "web_fetch"}
         ]
-        if web_cluster:
+        if web_cluster and not preferred_names:
             return web_cluster[:limit]
     scored: list[tuple[float, int, dict]] = []
     mandatory: list[dict] = []
@@ -218,11 +399,20 @@ def route_tools(tools: list[dict], context: str, *, threshold: int, limit: int) 
         name_tokens = _tokens(name.replace("_", " "))
         description_tokens = _tokens(description + " " + properties)
         score = 4.0 * len(wanted & name_tokens) + 1.5 * len(wanted & description_tokens)
+        # Preference is applied only within the already-authorized catalogue.
+        # It never registers a tool or bypasses an allow/deny policy.
+        if name in preferred_names:
+            score += 1_000_000
         # 稳定的轻微位置偏置仅用于同分排序。
         scored.append((score, -index / 10000.0, tool))
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    slots = max(0, limit - min(limit, len(mandatory)))
-    return mandatory[:limit] + [item[2] for item in scored[:slots]]
+    # Even the smallest configured shortlist must leave a slot for an
+    # authorized explicit choice. Planning/evidence controls are also enforced
+    # by the orchestrator after routing.
+    reserve = int(any(item[2]["function"]["name"] in preferred_names for item in scored))
+    mandatory = mandatory[:max(0, limit - reserve)]
+    slots = max(0, limit - len(mandatory))
+    return mandatory + [item[2] for item in scored[:slots]]
 
 
 def _coerce(value: Any, schema: dict) -> Any:
@@ -240,8 +430,10 @@ def _coerce(value: Any, schema: dict) -> Any:
                 return False
     if expected == "integer" and not isinstance(value, bool):
         try:
+            if isinstance(value, float) and not value.is_integer():
+                return value
             return int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return value
     if expected == "number" and not isinstance(value, bool):
         try:
@@ -271,6 +463,57 @@ def _valid_type(value: Any, expected: Any) -> bool:
         "object": isinstance(value, dict),
         "null": value is None,
     }.get(expected, True)
+
+
+def _schema_errors(value: Any, schema: dict, path: str = "参数", depth: int = 0) -> list[str]:
+    """校验工具常用结构约束；不猜测缺失值，也不改写嵌套业务数据。"""
+    if not isinstance(schema, dict):
+        return []
+    if depth > 32:
+        return [f"{path} 嵌套超过校验深度"]
+    if not _valid_type(value, schema.get("type")):
+        return [f"{path} 类型应为 {schema.get('type')}"]
+    errors = []
+    if isinstance(schema.get("enum"), list) and value not in schema["enum"]:
+        errors.append(f"{path} 必须是 {schema['enum']} 之一")
+    if isinstance(value, dict):
+        properties = schema.get("properties") or {}
+        for name in schema.get("required") or []:
+            if name not in value or value[name] in (None, ""):
+                errors.append(f"缺少必填参数 {path}.{name}")
+        for name, item in value.items():
+            field = properties.get(name)
+            if isinstance(field, dict):
+                errors.extend(_schema_errors(item, field, f"{path}.{name}", depth + 1))
+            elif schema.get("additionalProperties") is False:
+                errors.append(f"{path}.{name} 不接受未知参数")
+    elif isinstance(value, list):
+        for key, invalid in (
+            ("minItems", lambda limit: len(value) < limit),
+            ("maxItems", lambda limit: len(value) > limit),
+        ):
+            if isinstance(schema.get(key), int) and invalid(schema[key]):
+                errors.append(f"{path} 不满足 {key}={schema[key]}")
+        if isinstance(schema.get("items"), dict):
+            for index, item in enumerate(value):
+                errors.extend(_schema_errors(item, schema["items"], f"{path}[{index}]", depth + 1))
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        for key, invalid in (
+            ("minimum", lambda limit: value < limit),
+            ("maximum", lambda limit: value > limit),
+            ("exclusiveMinimum", lambda limit: value <= limit),
+            ("exclusiveMaximum", lambda limit: value >= limit),
+        ):
+            if isinstance(schema.get(key), (int, float)) and invalid(schema[key]):
+                errors.append(f"{path} 不满足 {key}={schema[key]}")
+    elif isinstance(value, str):
+        for key, invalid in (
+            ("minLength", lambda limit: len(value) < limit),
+            ("maxLength", lambda limit: len(value) > limit),
+        ):
+            if isinstance(schema.get(key), int) and invalid(schema[key]):
+                errors.append(f"{path} 不满足 {key}={schema[key]}")
+    return errors
 
 
 def repair_arguments(
@@ -315,20 +558,12 @@ def repair_arguments(
                         args[name] = match
                         repairs.append(f"{name}:枚举规范化")
 
-    for name in spec.get("required") or []:
-        if name not in args or args[name] in (None, ""):
-            errors.append(f"缺少必填参数 {name}")
-    for name, value in args.items():
-        field = properties.get(name)
-        if field and not _valid_type(value, field.get("type")):
-            errors.append(f"参数 {name} 类型应为 {field.get('type')}")
-        if field and isinstance(field.get("enum"), list) and value not in field["enum"]:
-            errors.append(f"参数 {name} 必须是 {field['enum']} 之一")
     if spec.get("additionalProperties") is False:
         unknown = [name for name in args if name not in properties]
         for name in unknown:
             args.pop(name, None)
             repairs.append(f"移除未知参数 {name}")
+    errors.extend(_schema_errors(args, spec))
     return args, repairs, errors
 
 
@@ -343,36 +578,66 @@ class Observation:
 
 def analyze_observation(result: Any, max_chars: int = 6000) -> Observation:
     """由规则引擎解析工具结果，不把大段日志直接交给模型做 Reflection。"""
-    raw = str(result or "")
-    structured = None
-    try:
-        structured = json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
-        pass
-    structured_failure = (
-        isinstance(structured, dict)
-        and (
-            structured.get("ok") is False
-            or bool(structured.get("error"))
-        )
+    if isinstance(result, Observation):
+        # 缓存保留分析结果；展示摘要不是新的工具执行结果，不能重新推断成功。
+        return result
+    structured = result if isinstance(result, (dict, list)) else None
+    raw = (
+        json.dumps(result, ensure_ascii=False, default=str)
+        if structured is not None else str(result if result is not None else "")
     )
-    matched = "structured_error" if structured_failure else next(
-        (pattern.pattern for pattern in _ERROR_PATTERNS if pattern.search(raw)), ""
+    if structured is None:
+        try:
+            structured = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            pass
+
+    # 仅解释结果信封和 MCP text/structuredContent，不扫描任意业务对象中的错误词。
+    envelopes = []
+    pending = [structured]
+    while pending and len(envelopes) < 64:
+        item = pending.pop(0)
+        if not isinstance(item, dict):
+            continue
+        envelopes.append(item)
+        if isinstance(item.get("structuredContent"), dict):
+            pending.append(item["structuredContent"])
+        if "jsonrpc" in item and isinstance(item.get("result"), dict):
+            pending.append(item["result"])
+        for block in item.get("content", []) if isinstance(item.get("content"), list) else []:
+            if isinstance(block, dict) and block.get("type") == "text":
+                try:
+                    pending.append(json.loads(block.get("text") or ""))
+                except (TypeError, json.JSONDecodeError):
+                    pass
+    structured_error = next((
+        item for item in envelopes
+        if item.get("ok") is False or item.get("isError") is True or bool(item.get("error"))
+    ), None)
+    structured_failure = structured_error is not None
+    explicit_success = any(
+        item.get("ok") is True or item.get("isError") is False for item in envelopes
+    )
+    matched = "structured_error" if structured_failure else (
+        "" if explicit_success else next(
+            (pattern.pattern for pattern in _ERROR_PATTERNS if pattern.search(raw)), ""
+        )
     )
     ok = not matched
     error_type = ""
     error_code = ""
     if structured_failure:
         error_type = "structured_error"
-        structured_error = structured.get("error")
-        if isinstance(structured_error, dict):
+        envelope = structured_error
+        error = envelope.get("error")
+        if isinstance(error, dict):
             error_type = str(
-                structured_error.get("type") or structured_error.get("name")
+                error.get("type") or error.get("name")
                 or error_type
             )[:64]
-            error_code = str(structured_error.get("code") or "")[:64]
+            error_code = str(error.get("code") or "")[:64]
         else:
-            error_code = str(structured.get("code") or "")[:64]
+            error_code = str(envelope.get("code") or "")[:64]
     elif matched:
         http_match = re.search(r"\bHTTP\s*([45]\d\d)\b", raw, re.IGNORECASE)
         timeout_match = re.search(

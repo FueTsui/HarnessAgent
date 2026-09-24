@@ -6,6 +6,9 @@ from sqlalchemy import engine_from_config, pool
 from backend.config import settings
 from backend.database import Base
 import backend.models  # noqa: F401 - 注册元数据
+import backend.memory_store  # noqa: F401
+import backend.guardrail_models  # noqa: F401
+import backend.service_models  # noqa: F401
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("%", "%%"))

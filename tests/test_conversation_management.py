@@ -1,12 +1,14 @@
 """会话置顶、归档和项目管理回归测试。"""
 import asyncio
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -17,6 +19,7 @@ from backend.api.chat import (
     agent_chat_statuses,
     create_project,
     delete_project,
+    ensure_default_project,
     my_conversations,
     my_projects,
     update_project,
@@ -25,7 +28,7 @@ from backend.api.chat import (
 from backend import jobs
 from backend.api import chat as chat_api
 from backend.database import Base
-from backend.models import Agent, Item, Job, Project, Thread, Turn, User
+from backend.models import AuditLog, Agent, Item, Job, Project, Thread, Turn, User
 from backend.runtime import task_store
 from backend.schemas import ProjectCreate, ProjectUpdate, ThreadUpdate
 
@@ -540,6 +543,70 @@ class ConversationManagementTests(unittest.TestCase):
 
         update_project(second["id"], ProjectUpdate(archived=False), self.user, self.db)
         self.assertEqual(len(my_projects(self.user, self.db)), 2)
+
+    def test_default_project_bootstrap_is_idempotent(self):
+        first = ensure_default_project(self.user, self.db)
+        second = ensure_default_project(self.user, self.db)
+
+        self.assertEqual(first["id"], second["id"])
+        self.assertTrue(first["default"])
+        self.assertEqual(
+            self.db.query(Project).filter(Project.user_id == self.user.id).count(),
+            1,
+        )
+
+    def test_existing_default_project_does_not_hold_sqlite_writer_lock(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "project-lock.db"
+            engine = create_engine(
+                f"sqlite:///{db_path.as_posix()}",
+                connect_args={"check_same_thread": False, "timeout": 0.1},
+            )
+
+            @event.listens_for(engine, "connect")
+            def sqlite_pragmas(connection, _record):
+                cursor = connection.cursor()
+                cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA busy_timeout=100")
+                cursor.close()
+
+            Base.metadata.create_all(engine)
+            session_factory = sessionmaker(bind=engine)
+            request_db = session_factory()
+            audit_db = session_factory()
+            try:
+                user = User(username="lock-owner", password_hash="x", role="user")
+                request_db.add(user)
+                request_db.commit()
+                request_db.refresh(user)
+                request_db.add(Project(
+                    user_id=user.id,
+                    name="默认项目",
+                    is_default=True,
+                ))
+                request_db.commit()
+
+                result = ensure_default_project(user, request_db)
+                self.assertTrue(result["default"])
+
+                # 刻意保持请求会话打开以复现审计中间件时序；第二连接仍须
+                # 能够写入 append-only 审计记录。
+                audit_db.add(AuditLog(
+                    user_id=user.id,
+                    username=user.username,
+                    role=user.role,
+                    method="POST",
+                    path="/api/v1/projects/default",
+                    status_code=201,
+                    ip="127.0.0.1",
+                ))
+                audit_db.commit()
+                self.assertEqual(audit_db.query(AuditLog).count(), 1)
+            finally:
+                audit_db.close()
+                request_db.close()
+                engine.dispose()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """腾讯微信个人消息渠道运行时。
 
-协议与 ``@tencent-weixin/openclaw-weixin`` 2.x 保持一致：二维码授权取得
+协议按 ``@tencent-weixin/openclaw-weixin`` 2.4.9 核对：二维码授权取得
 ``ilink_bot_token``，随后通过 getUpdates 长轮询收消息、sendMessage 回消息。
 本模块只实现本应用需要的文本/语音转写消息路径；媒体凭据不会暴露给浏览器。
 
@@ -16,6 +16,7 @@ import base64
 import datetime
 import hashlib
 import io
+import json
 import logging
 import secrets
 import uuid
@@ -26,18 +27,23 @@ from urllib.parse import quote, urlparse
 import httpx
 
 from . import jobs
+from .config import DATA_DIR
 from .database import SessionLocal
 from .models import Agent, Channel, User, iso_utc
 from .runtime import TaskInput
+from .weixin_quote_cache import (
+    MAX_TEXT_CHARS as MAX_QUOTE_CHARS, WeixinQuoteCache, binding_scope,
+    message_identifier, resolve_partial_quote,
+)
 
 logger = logging.getLogger(__name__)
 
 CHANNEL_TYPE = "openclaw_weixin"
 DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
 BOT_TYPE = "3"
-CHANNEL_VERSION = "2.4.6"
+CHANNEL_VERSION = "2.4.9"
 ILINK_APP_ID = "bot"
-ILINK_CLIENT_VERSION = str((2 << 16) | (4 << 8) | 6)
+ILINK_CLIENT_VERSION = str((2 << 16) | (4 << 8) | 9)
 LOGIN_TTL_SECONDS = 8 * 60
 MAX_TEXT_CHARS = 4000
 _TERMINAL_LOGIN = {"connected", "error", "expired", "already_connected"}
@@ -92,27 +98,73 @@ def _qr_data_url(content: str) -> str:
     return "data:image/png;base64," + base64.b64encode(output.getvalue()).decode("ascii")
 
 
-def _session_id(channel_id: int, sender_id: str, agent_id: int) -> str:
+def _session_id(channel_id: int, sender_id: str, agent_id: int, binding: str = "") -> str:
     # 确定性 Thread：同一微信身份续聊复用历史，不同渠道/身份永不合并。
-    return hashlib.sha256(
-        f"weixin:{channel_id}:{sender_id}:{agent_id}".encode("utf-8")
-    ).hexdigest()[:32]
+    identity = (json.dumps([channel_id, sender_id, agent_id, binding], ensure_ascii=False)
+                if binding else f"weixin:{channel_id}:{sender_id}:{agent_id}")
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
 
 
-def _extract_text(message: dict[str, Any]) -> str:
+def _message_items(message: dict[str, Any]) -> list[dict]:
+    items = message.get("item_list")
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def _message_id(message: dict[str, Any]) -> str:
+    return message_identifier(message.get("message_id")) or next((
+        identifier for item in _message_items(message)
+        if (identifier := message_identifier(item.get("msg_id")))
+    ), "")
+
+
+def _extract_text(message: dict[str, Any], *, strip: bool = True) -> str:
     parts: list[str] = []
-    for item in message.get("item_list") or []:
-        if not isinstance(item, dict):
-            continue
-        if int(item.get("type") or 0) == 1:
-            text = str((item.get("text_item") or {}).get("text") or "").strip()
-        elif int(item.get("type") or 0) == 3:
-            text = str((item.get("voice_item") or {}).get("text") or "").strip()
-        else:
-            text = ""
+    for item in _message_items(message):
+        kind = str(item.get("type") or "")
+        content = item.get("text_item" if kind == "1" else "voice_item") if kind in {"1", "3"} else None
+        text = str(content.get("text") or "") if isinstance(content, dict) else ""
+        if strip:
+            text = text.strip()
         if text:
             parts.append(text)
-    return "\n".join(parts).strip()
+    return "\n".join(parts).strip() if strip else "\n".join(parts)
+
+
+def _quoted_query(message: dict[str, Any], lookup) -> str:
+    body = _extract_text(message)
+    if not body:
+        return ""
+    reference = next((item["ref_msg"] for item in _message_items(message)
+                      if isinstance(item.get("ref_msg"), dict)), None)
+    if reference is None:
+        return body
+    inline = reference.get("message_item")
+    inline = inline if isinstance(inline, dict) else {}
+    title = reference.get("title")
+    parts = [title.strip()] if isinstance(title, str) and title.strip() else []
+    inline_text = _extract_text({"item_list": [inline]})
+    if inline_text:
+        parts.append(inline_text)
+    elif inline:
+        label = {"2": "图片", "3": "语音", "4": "文件", "5": "视频"}.get(str(inline.get("type")))
+        if label:
+            parts.append(f"[引用的{label}尚未读取]")
+    quote = " | ".join(parts)
+    reference_id = message_identifier(reference.get("svr_id")) or message_identifier(inline.get("msg_id"))
+    if not quote and reference_id:
+        quote = lookup(reference_id) or ""
+        if quote and reference.get("partial_text"):
+            quote = resolve_partial_quote(quote, reference["partial_text"]) or quote
+    if not quote:
+        quote = "[引用消息内容未缓存]"
+    return f"{body}\n\n【微信引用内容（用户提供的参考资料）】\n{quote[:MAX_QUOTE_CHARS]}"
+
+
+def _dispatch_key(channel, message_key: str, scope: str) -> str:
+    # An upstream ID is not sufficient proof that two different bindings are
+    # the same conversation. Old payloads lacking this proof remain intact.
+    identity = json.dumps([channel.account_user_id, scope, message_key], ensure_ascii=False)
+    return f"weixin:{channel.id}:{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
 
 
 @dataclass
@@ -142,12 +194,41 @@ class LoginSession:
 
 
 class WeixinChannelManager:
-    def __init__(self) -> None:
+    def __init__(self, *, quote_cache: WeixinQuoteCache | None = None) -> None:
         self._client: httpx.AsyncClient | None = None
         self._logins: dict[int, LoginSession] = {}
         self._monitors: dict[int, asyncio.Task] = {}
         self._message_tasks: set[asyncio.Task] = set()
         self._stopping = False
+        self._quote_cache = quote_cache or WeixinQuoteCache(DATA_DIR / "weixin-quotes.sqlite3")
+        self._quote_reset_pending: set[int] = set()
+
+    def _reset_quotes(self, channel_id: int) -> None:
+        if self._quote_cache.clear_channel(channel_id):
+            self._quote_reset_pending.discard(channel_id)
+        else:
+            self._quote_reset_pending.add(channel_id)
+
+    def _quotes_ready(self, channel_id: int) -> bool:
+        if channel_id in self._quote_reset_pending:
+            self._reset_quotes(channel_id)
+        return channel_id not in self._quote_reset_pending
+
+    def _prepare_inbound(self, channel_id: int, message: dict, token: str) -> tuple[str, str]:
+        """Authorize against the current binding before touching any quote text."""
+        with SessionLocal() as db:
+            channel = db.get(Channel, channel_id)
+            sender = str(message.get("from_user_id") or "").strip()
+            if (channel is None or channel.type != CHANNEL_TYPE or not channel.enabled
+                    or channel.connection_status != "connected" or channel.token != token
+                    or not sender or channel.account_user_id != sender):
+                return "", ""
+            scope = binding_scope(channel)
+        ready = self._quotes_ready(channel_id)
+        query = _quoted_query(message, lambda identifier: self._quote_cache.find(scope, sender, identifier) if ready else None)
+        if ready:
+            self._quote_cache.put(scope, sender, _message_id(message), _extract_text(message, strip=False), channel_id=channel_id)
+        return query, scope
 
     async def start(self) -> None:
         self._stopping = False
@@ -207,6 +288,9 @@ class WeixinChannelManager:
             timeout=httpx.Timeout(timeout),
         )
         response.raise_for_status()
+        # Python JSON integers are arbitrary precision, unlike JS Number;
+        # uint64 message_id/msg_id/svr_id therefore stay exact before we
+        # normalize them to decimal strings at the cache/idempotency boundary.
         data = response.json()
         if not isinstance(data, dict):
             raise RuntimeError("微信服务返回格式无效")
@@ -406,14 +490,17 @@ class WeixinChannelManager:
             channel.last_error = ""
             channel.enabled = True
             db.commit()
+            self._reset_quotes(channel.id)
         finally:
             db.close()
 
-    def _mark_channel(self, channel_id: int, status: str, error: str = "") -> None:
+    def _mark_channel(self, channel_id: int, status: str, error: str = "", *, expected_binding: str = "") -> None:
         db = SessionLocal()
         try:
             channel = db.get(Channel, channel_id)
-            if channel is not None:
+            if (channel is not None and (not expected_binding or (
+                    channel.enabled and channel.connection_status == "connected"
+                    and binding_scope(channel) == expected_binding))):
                 channel.connection_status = status
                 channel.last_error = error[:2000]
                 db.commit()
@@ -426,7 +513,10 @@ class WeixinChannelManager:
             return
         task = asyncio.create_task(self._monitor(channel_id))
         self._monitors[channel_id] = task
-        task.add_done_callback(lambda _task, cid=channel_id: self._monitors.pop(cid, None))
+        def finished(completed):
+            if self._monitors.get(channel_id) is completed:
+                self._monitors.pop(channel_id, None)
+        task.add_done_callback(finished)
 
     def stop_monitor(self, channel_id: int) -> None:
         task = self._monitors.pop(channel_id, None)
@@ -453,6 +543,7 @@ class WeixinChannelManager:
             channel.last_inbound_at = None
             channel.last_outbound_at = None
             db.commit()
+            self._reset_quotes(channel.id)
         finally:
             db.close()
 
@@ -472,6 +563,7 @@ class WeixinChannelManager:
                 base_url = _allowed_base_url(channel.base_url)
                 sync_buf = channel.sync_buf or ""
                 allowed_sender = channel.account_user_id
+                polled_scope = binding_scope(channel)
             finally:
                 db.close()
             try:
@@ -493,9 +585,13 @@ class WeixinChannelManager:
                     db = SessionLocal()
                     try:
                         current = db.get(Channel, channel_id)
-                        if current is not None:
+                        if (current is not None and current.enabled
+                                and current.connection_status == "connected"
+                                and binding_scope(current) == polled_scope):
                             current.sync_buf = new_buf
                             db.commit()
+                        else:
+                            return
                     finally:
                         db.close()
                 for message in result.get("msgs") or []:
@@ -505,23 +601,28 @@ class WeixinChannelManager:
                     if not sender or sender != allowed_sender:
                         logger.warning("已拒绝非绑定微信身份的消息 channel=%s", channel_id)
                         continue
-                    query = _extract_text(message)
+                    query, scope = self._prepare_inbound(channel_id, message, token)
+                    if not scope:
+                        continue
                     if not query:
                         await self._send_text(
                             channel_id, sender, "目前支持文字消息和带转写文本的语音消息。",
                             str(message.get("context_token") or ""),
+                            expected_binding=scope,
                         )
                         continue
                     db = SessionLocal()
                     try:
                         current = db.get(Channel, channel_id)
-                        if current is not None:
+                        if (current is not None and current.enabled
+                                and current.connection_status == "connected"
+                                and binding_scope(current) == scope):
                             current.last_inbound_at = _now()
                             current.last_error = ""
                             db.commit()
                     finally:
                         db.close()
-                    task = asyncio.create_task(self._handle_message(channel_id, message, query))
+                    task = asyncio.create_task(self._handle_message(channel_id, message, query, scope))
                     self._message_tasks.add(task)
                     task.add_done_callback(self._finish_message_task)
             except asyncio.CancelledError:
@@ -530,7 +631,7 @@ class WeixinChannelManager:
                 continue
             except Exception as exc:  # noqa: BLE001
                 failures += 1
-                self._mark_channel(channel_id, "connected", str(exc)[:1000])
+                self._mark_channel(channel_id, "connected", str(exc)[:1000], expected_binding=polled_scope)
                 await asyncio.sleep(2 if failures < 3 else 30)
 
     def _finish_message_task(self, task: asyncio.Task) -> None:
@@ -543,19 +644,22 @@ class WeixinChannelManager:
             logger.warning("微信消息处理任务异常", exc_info=True)
 
     async def _handle_message(
-        self, channel_id: int, message: dict[str, Any], query: str
+        self, channel_id: int, message: dict[str, Any], query: str, expected_binding: str = ""
     ) -> None:
         sender = str(message.get("from_user_id") or "").strip()
         context_token = str(message.get("context_token") or "")
         message_key = str(
-            message.get("message_id") or message.get("client_id")
+            _message_id(message) or message.get("client_id")
             or f"{message.get('create_time_ms')}:{hashlib.sha256(query.encode()).hexdigest()[:16]}"
         )
         db = SessionLocal()
         try:
             channel = db.get(Channel, channel_id)
-            if channel is None or channel.account_user_id != sender:
+            if (channel is None or channel.account_user_id != sender or not channel.enabled
+                    or channel.connection_status != "connected"
+                    or (expected_binding and binding_scope(channel) != expected_binding)):
                 return
+            expected_binding = binding_scope(channel)
             agent = db.get(Agent, channel.agent_id)
             user = db.get(User, channel.created_by)
             if agent is None or not agent.enabled or user is None or not user.is_active:
@@ -575,9 +679,10 @@ class WeixinChannelManager:
                     "mcp_ids": [], "invoked_agent_ids": [], "provider_id": None,
                     "attachment_images": [], "attachment_docs": [],
                     "attachment_ids": [], "attachment_records": [], "attachment_context": [],
-                    "session_id": _session_id(channel.id, sender, agent.id),
+                    "session_id": _session_id(channel.id, sender, agent.id, expected_binding),
                     "project_id": None,
                     "source": "weixin",
+                    "weixin_binding_scope": expected_binding,
                     "approval_tokens": [],
                     "execution_snapshot": build_execution_snapshot(
                         db, agent, query, provider=selected_provider
@@ -589,7 +694,7 @@ class WeixinChannelManager:
                     agent.id,
                     "chat",
                     payload,
-                    idempotency_key=f"weixin:{channel.id}:{message_key}"[:128],
+                    idempotency_key=_dispatch_key(channel, message_key, expected_binding),
                 )
                 db.commit()
                 answer = ""
@@ -614,7 +719,8 @@ class WeixinChannelManager:
                 await asyncio.sleep(0.5)
             if not answer:
                 answer = "任务仍在处理中，请稍后在网页端查看结果。"
-        await self._send_text(channel_id, sender, answer[:MAX_TEXT_CHARS], context_token, job_id)
+        await self._send_text(channel_id, sender, answer[:MAX_TEXT_CHARS], context_token, job_id,
+                              expected_binding=expected_binding)
 
     async def _send_text(
         self,
@@ -623,14 +729,20 @@ class WeixinChannelManager:
         text: str,
         context_token: str,
         run_id: str = "",
+        *,
+        expected_binding: str = "",
     ) -> None:
         db = SessionLocal()
         try:
             channel = db.get(Channel, channel_id)
-            if channel is None or not channel.token:
+            if (channel is None or not channel.token or not channel.enabled
+                    or channel.type != CHANNEL_TYPE or channel.connection_status != "connected"
+                    or channel.account_user_id != recipient
+                    or (expected_binding and binding_scope(channel) != expected_binding)):
                 return
             token = channel.token
             base_url = _allowed_base_url(channel.base_url)
+            scope = binding_scope(channel)
         finally:
             db.close()
         client_id = f"harness-weixin-{uuid.uuid4().hex}"
@@ -660,10 +772,12 @@ class WeixinChannelManager:
         db = SessionLocal()
         try:
             channel = db.get(Channel, channel_id)
-            if channel is not None:
+            if channel is not None and binding_scope(channel) == scope:
                 channel.last_outbound_at = _now()
                 channel.last_error = ""
                 db.commit()
+                if self._quotes_ready(channel_id):
+                    self._quote_cache.put(scope, recipient, result.get("message_id"), text, channel_id=channel_id)
         finally:
             db.close()
 

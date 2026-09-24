@@ -1,5 +1,6 @@
 """现代对话 UI 的结构回归测试。"""
 import re
+import json
 import subprocess
 import unittest
 from pathlib import Path
@@ -16,18 +17,15 @@ class FrontendUiTests(unittest.TestCase):
         for marker in (
             'id="mobile-scrim"',
             'id="sidebar-expand"',
-            'id="theme-toggle"',
+            'id="rail-search"',
+            'id="rail-projects"',
+            'id="account-menu-btn"',
+            'aria-controls="account-menu"',
             'id="run-drawer"',
             'id="schedule-reminders"',
             'id="schedule-reminder-list"',
             'id="add-menu-btn"',
             'id="command-btn"',
-            'id="model-btn"',
-            'id="model-btn-label"',
-            'id="model-menu"',
-            'id="approval-policy-btn"',
-            'id="approval-policy-label"',
-            'id="approval-policy-menu"',
             'id="mic-btn"',
             'id="composer-project-context"',
             'id="composer-project-name"',
@@ -44,9 +42,7 @@ class FrontendUiTests(unittest.TestCase):
             'id="pinned-project-list"',
             'id="project-section-toggle"',
             'id="recent-section-toggle"',
-            'id="recent-more-btn"',
             'id="recent-new-chat-btn"',
-            'id="recent-section-menu"',
             'id="thread-context-menu"',
             'id="project-context-menu"',
             'id="rename-thread-dialog"',
@@ -63,13 +59,36 @@ class FrontendUiTests(unittest.TestCase):
         self.assertIn('form.append("skill_ids"', script)
         self.assertIn('form.append("mcp_ids"', script)
         self.assertIn('form.append("invoked_agent_ids"', script)
-        self.assertIn('form.append("provider_id"', script)
-        self.assertIn('form.append("approval_policy", state.approvalPolicy)', script)
+        self.assertIn('form.append("provider_id", options.provider_id == null ? "" : String(options.provider_id))', script)
+        self.assertIn('form.append("approval_policy", options.approval_policy)', script)
+        self.assertIn('form.append("reasoning_effort", options.reasoning_effort)', script)
         self.assertIn('full_access: {', script)
-        self.assertIn('完全访问仅限 root', script)
+        self.assertIn("ChatWorkspace.normalizePreferences", script)
+        self.assertIn('/api/v1/users/me/preferences', script)
+        self.assertIn('await loadPreferences();', script)
         self.assertIn('eventType === "approval.auto_approved"', script)
         self.assertIn("/api/v1/chat/models?agent_id=", script)
-        self.assertIn("仅显示设置中已开放的模型", script)
+        self.assertNotIn("chat_model_provider:", script)
+        self.assertNotIn("chat_approval_policy:", script)
+        for control in ("model-btn", "approval-policy-btn", "model-menu", "approval-policy-menu",
+                        "reasoning-effort-label", "reasoning-menu", "reasoning-slider", "reasoning-reset"):
+            self.assertIn(f'id="{control}"', html)
+        self.assertNotIn('id="reasoning-btn"', html)
+        self.assertIn('aria-controls="reasoning-menu" aria-haspopup="dialog"', html)
+        self.assertNotIn('class="model-menu-icon"', script)
+        for removed in ("theme-toggle", "change-password-btn", "project-dialog", "memory-dialog",
+                        "recent-section-menu"):
+            self.assertNotIn(f'id="{removed}"', html)
+        self.assertIn('/admin#projects', script)
+        self.assertIn('/admin#conversation-memory/', script)
+        self.assertIn('href="/admin#preferences"', html)
+        self.assertIn('setAccountMenu(false, {restoreFocus: true})', script)
+        chat_css = (ROOT / "frontend/static/chat-workspace.css").read_text(encoding="utf-8")
+        self.assertIn('grid-template-columns: 64px minmax(0, 1fr)', chat_css)
+        self.assertIn('.chat-page .chat-sidebar { padding: 14px 12px 12px; overflow: visible; }', chat_css)
+        literal_ids = set(re.findall(r'id="([^"]+)"', html))
+        script_ids = set(re.findall(r'\$\("([^"$]+)"\)', script))
+        self.assertFalse(script_ids - literal_ids, f"Dangling UI references: {script_ids - literal_ids}")
         self.assertIn("startAgentWork", script)
         self.assertIn("updateAgentWork", script)
         self.assertIn("summarizeTaskGoal", script)
@@ -151,7 +170,7 @@ class FrontendUiTests(unittest.TestCase):
         self.assertIn("const light = activeConversationLight()", script)
         self.assertIn('if (!state.sessionId) return {key: "idle", ...AGENT_LIGHTS.idle}', script)
         self.assertIn("function markAgentStatusSeen", script)
-        self.assertIn('if (jobCreated && state.runningJob && ["done", "failed"].includes(runOutcome))', script)
+        self.assertIn('if (submittedJobId && ["done", "failed"].includes(runOutcome))', script)
         self.assertIn('error: {label: "执行错误", color: "#ff7373"}', script)
         self.assertNotIn('completed: {label: "执行完成", color: "#9bf396"}', script)
         self.assertIn('terminalUnread && row.terminal_status === "failed"', script)
@@ -212,7 +231,8 @@ class FrontendUiTests(unittest.TestCase):
         self.assertIn('context.closest(".composer").classList.toggle("has-project-context"', script)
         self.assertIn('localStorage.getItem("chat_project_collapsed")', script)
         self.assertIn('localStorage.getItem("chat_recent_collapsed")', script)
-        self.assertIn('localStorage.getItem("chat_recent_sort")', script)
+        self.assertNotIn('localStorage.getItem("chat_recent_sort")', script)
+        self.assertIn("state.recentSortMode = preferences.recent_sort", script)
         self.assertIn('newChat({projectId: null})', script)
         self.assertIn('form.append("project_id"', script)
         self.assertIn("else if (!current.title && row.title)", script)
@@ -248,7 +268,7 @@ class FrontendUiTests(unittest.TestCase):
         self.assertIn('/guidance`', script)
         self.assertIn('["new", "redirect"].includes(target)', script)
         self.assertIn('"已设为当前目标，正在停止旧目标"', script)
-        self.assertIn('hasStructuredContext ? "加入对话队列" : "添加到对话引导"', script)
+        self.assertIn('hasStructuredContext || hasComposerOverrides() ? "加入对话队列" : "添加到对话引导"', script)
         self.assertNotIn("duplexMode", script)
         self.assertIn("renderEvaluationReport", script)
         self.assertIn('eventType === "evaluation.completed"', script)
@@ -378,7 +398,8 @@ equal(runtimeEventPresentation("task.completed", {status: "completed"}, successf
         result = subprocess.run(
             ["node", "-"],
             input=(
-                helper_source
+                'const RunWorkspace = require("./frontend/static/run-workspace.js");\n'
+                + helper_source
                 + "\nfunction renderAgentWork() {}\nfunction setAnswerDeliveryState() {}\n"
                 + task_event_source
                 + "\nconst APPROVAL_POLICIES = {}; const TOOL_ACTIONS = {};\n"
@@ -411,7 +432,7 @@ equal(runtimeEventPresentation("task.completed", {status: "completed"}, successf
         self.assertIn("受限结果已验证并保存，部分计划步骤未完成", reconnect)
         self.assertIn('limited ? "warning" : "done"', reconnect)
 
-        self.assertIn('function addTurnEvent(text, kind = "progress", key = "")', script)
+        self.assertIn('function addTurnEvent(text, kind = "progress", key = "", category = "activity", timestamp = "")', script)
         self.assertIn('item.dataset.eventKey === cleanKey', script)
         self.assertIn(
             'runtimeActivityIdentity(eventType, payload) === "terminal-outcome"',
@@ -426,11 +447,33 @@ equal(runtimeEventPresentation("task.completed", {status: "completed"}, successf
         self.assertIn('class="code-block"', script)
         self.assertIn("data-copy-code", script)
         self.assertIn("navigator.clipboard", script)
-        self.assertNotIn("gca_token", script)
+        self.assertIn('localStorage.removeItem("gca_token")', script)
+        self.assertNotRegex(script, r'(?:localStorage|sessionStorage)\.(?:getItem|setItem)\(\s*[\"\']gca_token[\"\']')
         self.assertNotIn('headers["Authorization"]', script)
         self.assertIn("error.status = resp.status", script)
-        self.assertIn('fetch("/api/v1/auth/me")', script)
+        self.assertIn('fetch("/api/v1/auth/me", {credentials: "same-origin"})', script)
         self.assertIn("URL.createObjectURL(blob)", script)
+        auth_source = script[:script.index("async function api")]
+        verification = r'''
+const assert = require("node:assert/strict");
+const removed = [];
+global.localStorage = {
+  getItem(){throw new Error("Browser storage must not supply identity or tokens");},
+  setItem(){throw new Error("Browser storage must not receive identity or tokens");},
+  removeItem(key){removed.push(key);},
+};
+'''
+        verification += auth_source + r'''
+Auth.save({id:1,username:"member",role:"user",modules:[]});
+assert.equal(Auth.username(),"member");
+assert.equal(Auth.role(),"user");
+assert.equal(Auth.canModule("providers"),false);
+assert.ok(removed.includes("gca_token"));
+Auth.clear();
+assert.equal(Auth.username(),null);
+'''
+        result = subprocess.run(["node", "-"], input=verification, text=True, encoding="utf-8", capture_output=True, cwd=ROOT)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
     def test_composer_accepts_drag_drop_clipboard_files_and_long_pasted_text(self):
         html = (ROOT / "frontend/index.html").read_text(encoding="utf-8")
@@ -466,7 +509,8 @@ equal(runtimeEventPresentation("task.completed", {status: "completed"}, successf
         self.assertIn("function syncResourceTokenLayout", script)
         self.assertIn("function updateComposerPlaceholder", script)
         self.assertIn('query.placeholder = ""', script)
-        self.assertIn('query.placeholder = project && !state.sessionId ? `在“${project.name}”中随心输入` : "随心输入"', script)
+        self.assertIn('`在“${project.name}”中开始对话…`', script)
+        self.assertIn('state.sessionId ? "继续提问或补充要求…" : "随心输入"', script)
         self.assertIn('window.addEventListener("resize", syncResourceTokenLayout)', script)
         self.assertIn("--composer-token-indent", css)
         self.assertIn(".composer-editor.tokens-stacked", css)
@@ -478,7 +522,7 @@ equal(runtimeEventPresentation("task.completed", {status: "completed"}, successf
         self.assertIn(':root[data-theme="dark"]', css)
         self.assertIn("@media (prefers-reduced-motion: reduce)", css)
         self.assertIn("--sidebar-width", css)
-        self.assertIn("--primary: #2563eb", css)
+        self.assertIn("--primary:", css)
         self.assertIn(".command-palette", css)
         self.assertIn(".chat-shell.sidebar-collapsed", css)
         self.assertIn(".agent-work-disclosure", css)
@@ -586,7 +630,9 @@ equal(runtimeEventPresentation("task.completed", {status: "completed"}, successf
             'detectModels: true',
             '"/api/v1/providers/discover-models"',
             'type: "json-keyvalue"',
-            'name: "reasoning_effort"',
+            'name: "reasoning_config"',
+            'ProviderReasoningConfig.mount',
+            'Object.assign(payload, state.providerReasoningEditor.read())',
             'name: "stream_idle_timeout_ms"',
             'name: "model_id"',
             'name: "model_input"',
@@ -650,8 +696,45 @@ equal(runtimeEventPresentation("task.completed", {status: "completed"}, successf
         chat_html = (ROOT / "frontend/index.html").read_text(encoding="utf-8")
         admin_html = (ROOT / "frontend/admin.html").read_text(encoding="utf-8")
         common_script = (ROOT / "frontend/static/common.js").read_text(encoding="utf-8")
+        chat_script = (ROOT / "frontend/static/app.js").read_text(encoding="utf-8")
 
-        self.assertIn('<span data-icon="settings"></span>设置</a>', chat_html)
+        self.assertIn('<span data-icon="settings"></span>后台管理</a>', chat_html)
+        self.assertIn('href="/admin#preferences" id="admin-link"', chat_html)
+        menu = chat_html.split('id="account-menu"', 1)[1].split("</div>", 1)[0]
+        menu_elements = re.findall(r'<(?:a|button)\b[^>]*role="menuitem"[^>]*>', menu)
+        menu_items = {
+            re.search(r'id="([^"]+)"', tag).group(1): {"hidden": bool(re.search(r'\bhidden(?:\s|>)', tag))}
+            for tag in menu_elements
+        }
+        self.assertEqual(set(menu_items), {"admin-link", "login-link", "logout-btn"})
+        self.assertTrue(all(menu_items[key]["hidden"] for key in ("admin-link", "login-link", "logout-btn")))
+        render_account = chat_script[chat_script.index("function renderAccount()"):chat_script.index('window.addEventListener("beforeunload"')]
+        verification = 'const assert = require("node:assert/strict");\n'
+        verification += 'const elements = ' + json.dumps(menu_items) + ';\n'
+        verification += r'''
+global.$ = id => elements[id] ||= {};
+let guest = false;
+global.Auth = {user:{id:1},isGuest:()=>guest,username:()=>guest?"visitor_fixture":"member",role:()=>guest?"guest":"user",canAccessSettings:()=>!guest};
+global.initials = value => value[0].toUpperCase();
+const menuIds = Object.keys(elements);
+const visible = () => menuIds.filter(id=>!elements[id].hidden).sort();
+'''
+        verification += render_account + r'''
+renderAccount();
+assert.deepEqual(visible(),["admin-link","logout-btn"]);
+assert.equal(elements["account-name"].textContent,"member");
+guest = true;
+renderAccount();
+assert.deepEqual(visible(),["login-link"]);
+assert.equal(elements["account-name"].textContent,"未登录");
+assert.equal(elements["account-role"].textContent,"登录后使用问答");
+assert.equal(elements["context-memory-btn"].hidden,true);
+assert.equal(elements["new-project-btn"].hidden,true);
+'''
+        result = subprocess.run(["node", "-"], input=verification, text=True, encoding="utf-8", capture_output=True, cwd=ROOT)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn('querySelectorAll(\'[role="menuitem"], [role="menuitemradio"]\')', chat_script)
+        self.assertIn('.filter(item => !item.hidden && !item.disabled)', chat_script)
         self.assertIn('<title>__BRAND_DOCUMENT_TITLE__</title>', admin_html)
         self.assertIn('<strong>设置</strong>', admin_html)
         self.assertNotIn("管理控制台", chat_html + admin_html + common_script)
@@ -669,7 +752,8 @@ equal(runtimeEventPresentation("task.completed", {status: "completed"}, successf
         self.assertIn('image.removeAttribute("src")', script)
         self.assertIn('Auth.canModule("agents")', script)
         self.assertIn('api("/api/v1/agents/enabled")', script)
-        self.assertIn("ensureResourceDependencies(state.activeResource)", script)
+        self.assertIn("await ensureResourceDependencies(key)", script)
+        self.assertIn("if (state.currentTab === key) openResourceEditor", script)
         self.assertIn("resourceUsesAgentSelect", script)
 
     def test_admin_navigation_has_distinct_icons_and_task_order(self):
@@ -683,14 +767,18 @@ equal(runtimeEventPresentation("task.completed", {status: "completed"}, successf
             r'<span class="ti" data-icon="([^"]+)"',
             html,
         )
-        self.assertEqual(len(tabs), 17)
-        self.assertEqual(len({icon_name for _, icon_name in tabs}), len(tabs))
+        self.assertEqual(len(tabs), 21)
+        workspace_tabs = tabs[3:]
+        self.assertEqual(len({icon_name for _, icon_name in workspace_tabs}), len(workspace_tabs))
+        for _, icon_name in tabs[:3]:
+            self.assertIn(f"  {icon_name}:", script)
         self.assertEqual(
             [tab_name for tab_name, _ in tabs],
             [
-                "agents", "providers", "operations", "improvement", "knowledge", "skills", "mcp",
-                "capabilities", "templates", "schedules", "channels", "keys",
-                "token-usage", "archive", "users", "settings", "audit",
+                "preferences", "projects", "conversation-memory",
+                "agents", "providers", "services", "tools", "knowledge",
+                "memory", "guardrails", "templates", "improvement", "operations",
+                "token-usage", "schedules", "channels", "keys", "archive", "users", "settings", "audit",
             ],
         )
         for icon_name in (
@@ -700,9 +788,19 @@ equal(runtimeEventPresentation("task.completed", {status: "completed"}, successf
         ):
             self.assertIn(f"  {icon_name}:", script)
         self.assertIn('class="sidebar admin-sidebar"', html)
-        self.assertIn('aria-label="设置模块"', html)
+        self.assertIn('aria-label="管理类别"', html)
+        self.assertIn('aria-label="当前类别功能"', html)
+        sidebar = html.split('id="admin-sidebar"', 1)[1].split("</aside>", 1)[0]
+        self.assertEqual(re.findall(r'data-category="([^"]+)"', sidebar),
+                         ["personal", "create", "optimize", "manage"])
+        self.assertNotIn("data-tab=", sidebar)
+        taskbar = html.split('id="admin-section-tabs"', 1)[1].split("</nav>", 1)[0]
+        self.assertEqual(taskbar.count('data-tab="'), 21)
+        self.assertEqual(re.findall(r'data-admin-category="([^"]+)"', taskbar),
+                         ["personal", "create", "optimize", "manage"])
         self.assertIn('aria-current="page"', html)
-        self.assertIn('<span>MCP</span>', html)
+        self.assertIn('id="tools-subnav"', html)
+        self.assertIn('["mcp", "MCP", "mcp"]', admin_script)
         self.assertNotIn("MCP 工具", html + admin_script)
         for removed_title in ("功能模块", "智能体运行", "能力与资源", "平台治理"):
             self.assertNotIn(removed_title, html)

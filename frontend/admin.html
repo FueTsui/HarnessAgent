@@ -6,39 +6,77 @@
   <title>__BRAND_DOCUMENT_TITLE__</title>
   <link id="brand-favicon" rel="icon" href="__BRAND_LOGO_URL__" />
   <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/admin-layout.css" />
+  <link rel="stylesheet" href="/static/agent-model-config.css" />
+  <link rel="stylesheet" href="/static/provider-reasoning-config.css" />
+  <link rel="stylesheet" href="/static/personal-settings.css" />
+  <link rel="stylesheet" href="/static/guardrails.css" />
+  <link rel="stylesheet" href="/static/memory-admin.css" />
+  <link rel="stylesheet" href="/static/services-admin.css" />
+  <link rel="stylesheet" href="/static/desktop-ui.css" />
+  <script src="/static/desktop-ui.js" defer></script>
 </head>
-<body class="admin-page">
-  <header class="topbar">
-    <h1 id="brand-title">__BRAND_MARKUP__</h1>
-    <div class="admin-context"><strong>设置</strong><span>Harness Control Plane</span></div>
+<body class="admin-page auth-pending" aria-busy="true">
+  <p id="admin-auth-status" class="admin-auth-status" role="status">正在验证登录状态…</p>
+  <a class="admin-skip-link" href="#admin-main">跳至主内容</a>
+  <header class="topbar" aria-label="工作空间导航">
+    <button type="button" class="icon-button admin-menu-toggle" id="admin-menu-toggle" aria-label="打开管理导航" aria-controls="admin-sidebar" aria-expanded="false"><span data-icon="menu"></span></button>
+    <div class="admin-workspace"><h1 class="admin-workspace-title">工作空间</h1></div>
+    <nav class="admin-breadcrumb" id="admin-breadcrumb" aria-label="当前位置"><span class="admin-context"><strong>设置</strong></span><span class="breadcrumb-divider" aria-hidden="true">/</span><span id="admin-page-label" aria-current="page">智能体</span></nav>
     <div class="right" id="topbar-right"></div>
   </header>
+  <button type="button" id="admin-sidebar-overlay" class="admin-sidebar-overlay" aria-label="关闭管理导航" hidden></button>
   <div class="app-shell">
-    <aside class="sidebar admin-sidebar" aria-label="设置导航">
-      <nav class="tabs" aria-label="设置模块">
+    <aside class="sidebar admin-sidebar" id="admin-sidebar" aria-label="后台管理导航">
+      <nav class="admin-categories" id="admin-categories" aria-label="管理类别">
+        <button type="button" class="admin-category" data-category="personal" aria-controls="admin-section-tabs"><span data-icon="settings"></span><span>个人</span></button>
+        <button type="button" class="admin-category" data-category="create" aria-controls="admin-section-tabs"><span data-icon="blocks"></span><span>创建</span></button>
+        <button type="button" class="admin-category" data-category="optimize" aria-controls="admin-section-tabs"><span data-icon="flask"></span><span>优化</span></button>
+        <button type="button" class="admin-category" data-category="manage" aria-controls="admin-section-tabs"><span data-icon="users"></span><span>管理</span></button>
+      </nav>
+      <a class="admin-back-link" href="/"><span data-icon="external"></span><span>返回对话</span></a>
+    </aside>
+    <main class="content" id="admin-main" tabindex="-1">
+      <nav class="admin-section-tabs" id="admin-section-tabs" aria-label="当前类别功能">
+        <div class="admin-nav-group nav-group" data-admin-category="personal" role="group" aria-labelledby="nav-personal-label" hidden>
+        <p class="admin-nav-label" id="nav-personal-label">个人</p>
+        <button type="button" class="tab" data-tab="preferences"><span class="ti" data-icon="settings"></span><span>个人偏好</span></button>
+        <button type="button" class="tab" data-tab="projects"><span class="ti" data-icon="folder"></span><span>项目设置</span></button>
+        <button type="button" class="tab" data-tab="conversation-memory"><span class="ti" data-icon="brain"></span><span>对话与记忆</span></button>
+        </div>
+        <div class="admin-nav-group nav-group" data-admin-category="create" role="group" aria-labelledby="nav-create-label" hidden>
+        <p class="admin-nav-label" id="nav-create-label">创建</p>
         <button type="button" class="tab active" data-tab="agents" aria-current="page"><span class="ti" data-icon="bot"></span><span>智能体</span></button>
-        <button type="button" class="tab" data-tab="providers"><span class="ti" data-icon="server"></span><span>模型</span></button>
-        <button type="button" class="tab root-only" data-tab="operations"><span class="ti" data-icon="activity"></span><span>运行中心</span></button>
-        <button type="button" class="tab" data-tab="improvement"><span class="ti" data-icon="flask"></span><span>改进实验室</span></button>
-        <button type="button" class="tab" data-tab="knowledge"><span class="ti" data-icon="database"></span><span>知识库</span></button>
-        <button type="button" class="tab" data-tab="skills"><span class="ti" data-icon="package"></span><span>Skills</span></button>
-        <button type="button" class="tab" data-tab="mcp"><span class="ti" data-icon="plug"></span><span>MCP</span></button>
-        <button type="button" class="tab root-only" data-tab="capabilities"><span class="ti" data-icon="blocks"></span><span>内置能力</span></button>
+        <button type="button" class="tab" data-tab="providers"><span class="ti" data-icon="blocks"></span><span>模型</span></button>
+        <button type="button" class="tab" data-tab="services"><span class="ti" data-icon="server"></span><span>服务</span></button>
+        <button type="button" class="tab" data-tab="tools"><span class="ti" data-icon="plug"></span><span>工具</span></button>
+        <button type="button" class="tab" data-tab="knowledge"><span class="ti" data-icon="database"></span><span>知识</span></button>
+        <button type="button" class="tab" data-tab="memory"><span class="ti" data-icon="brain"></span><span>记忆</span></button>
+        <button type="button" class="tab" data-tab="guardrails"><span class="ti" data-icon="shield"></span><span>护栏</span></button>
         <button type="button" class="tab" data-tab="templates"><span class="ti" data-icon="fileText"></span><span>模板</span></button>
+        </div>
+        <div class="admin-nav-group nav-group" data-admin-category="optimize" role="group" aria-labelledby="nav-optimize-label" hidden>
+        <p class="admin-nav-label" id="nav-optimize-label">优化</p>
+        <button type="button" class="tab" data-tab="improvement"><span class="ti" data-icon="flask"></span><span>评估与改进</span></button>
+        <button type="button" class="tab root-only" data-tab="operations"><span class="ti" data-icon="activity"></span><span>运行中心</span></button>
+        <button type="button" class="tab" data-tab="token-usage"><span class="ti" data-icon="chart"></span><span>用量分析</span></button>
+        </div>
+        <div class="admin-nav-group nav-group" data-admin-category="manage" role="group" aria-labelledby="nav-manage-label" hidden>
+        <p class="admin-nav-label" id="nav-manage-label">管理</p>
         <button type="button" class="tab" data-tab="schedules"><span class="ti" data-icon="calendarClock"></span><span>定时任务</span></button>
         <button type="button" class="tab" data-tab="channels"><span class="ti" data-icon="webhook"></span><span>消息渠道</span></button>
         <button type="button" class="tab" data-tab="keys"><span class="ti" data-icon="key"></span><span>API 密钥</span></button>
-        <button type="button" class="tab" data-tab="token-usage"><span class="ti" data-icon="chart"></span><span>Token 用量</span></button>
-        <button type="button" class="tab" data-tab="archive"><span class="ti" data-icon="archive"></span><span>归档</span></button>
-        <button type="button" class="tab root-only" data-tab="users"><span class="ti" data-icon="users"></span><span>用户</span></button>
+        <button type="button" class="tab" data-tab="archive"><span class="ti" data-icon="archive"></span><span>数据归档</span></button>
+        <button type="button" class="tab root-only" data-tab="users"><span class="ti" data-icon="users"></span><span>成员与权限</span></button>
         <button type="button" class="tab root-only" data-tab="settings"><span class="ti" data-icon="settings"></span><span>系统设置</span></button>
         <button type="button" class="tab root-only" data-tab="audit"><span class="ti" data-icon="clipboardList"></span><span>操作日志</span></button>
+        </div>
       </nav>
-    </aside>
-    <main class="content">
+      <section id="panel-personal" class="admin-panel" hidden><div id="personal-settings-content"></div></section>
+      <nav id="tools-subnav" class="module-subnav" aria-label="工具分类" hidden></nav>
       <section id="panel-agents" class="admin-panel">
         <div class="section-heading">
-          <div><div class="section-kicker">AGENT RUNTIME</div><h2>智能体</h2><p>配置身份、能力与不可变 Harness 版本。每次变更都会形成可审计的新版本。</p></div>
+          <div><div class="section-kicker">AGENTS</div><h2>智能体</h2><p>为每个任务配置专属智能体，连接模型、知识与工具。</p></div>
           <div class="section-actions">
             <button class="btn ghost" id="agent-import"><span data-icon="paperclip"></span>导入配置</button>
             <button class="btn ghost" id="agent-export"><span data-icon="external"></span>导出所选</button>
@@ -46,17 +84,40 @@
             <input type="file" id="agent-import-input" accept=".json,application/json" hidden />
           </div>
         </div>
+        <div class="admin-list-toolbar" id="agents-toolbar" aria-label="智能体搜索与筛选">
+          <label class="admin-search" for="agent-search"><span data-icon="search"></span><input id="agent-search" type="search" placeholder="搜索智能体名称或描述" autocomplete="off" /><span class="sr-only">搜索智能体</span></label>
+          <label class="admin-filter" for="agent-filter"><span>状态</span><select id="agent-filter"><option value="all">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option><option value="public">已公开</option></select></label>
+          <span class="admin-result-count" id="agents-count" role="status" aria-live="polite"></span>
+        </div>
         <div class="card-grid" id="agents-grid"></div>
+      </section>
+
+      <section id="panel-memory" class="admin-panel" hidden>
+        <div class="section-heading">
+          <div><div class="section-kicker">MEMORY</div><h2>记忆</h2><p>管理个人偏好、会话上下文和项目知识，按范围在后续对话中召回。</p></div>
+        </div>
+        <div id="memory-content" class="memory-dashboard"></div>
+      </section>
+
+      <section id="panel-guardrails" class="admin-panel" hidden>
+        <div class="section-heading">
+          <div><div class="section-kicker">GUARDRAILS</div><h2>护栏</h2><p>创建防护策略与阻止列表，选择应用的智能体和模型，检查输入、工具调用与输出。</p></div>
+        </div>
+        <div id="guardrails-content"></div>
+      </section>
+
+      <section id="panel-services" class="admin-panel" hidden>
+        <div id="services-content"></div>
       </section>
 
       <section id="panel-improvement" class="admin-panel" hidden>
         <div class="section-heading">
-          <div><div class="section-kicker">EVIDENCE-DRIVEN CHANGE</div><h2>改进实验室</h2><p>从运行证据提出最小变更；评估通过且人工批准后才发布。</p></div>
+          <div><div class="section-kicker">EVALUATION</div><h2>评估与改进</h2><p>从运行记录发现改进机会，提交提案、验证效果并审批发布。</p></div>
           <button class="btn" id="new-proposal"><span data-icon="plus"></span>新建提案</button>
         </div>
         <div class="lab-grid">
-          <div><h3>最近运行</h3><div id="runs-list" class="stack-list"></div></div>
-          <div><h3>修改提案</h3><div id="proposals-list" class="stack-list"></div></div>
+          <div><div class="admin-column-heading"><span class="admin-column-icon" data-icon="activity"></span><div><h3>最近运行</h3><p>追踪执行结果与评估依据</p></div></div><div id="runs-list" class="stack-list"></div></div>
+          <div><div class="admin-column-heading"><span class="admin-column-icon" data-icon="flask"></span><div><h3>改进提案</h3><p>从假设到经过验证的新版本</p></div></div><div id="proposals-list" class="stack-list"></div></div>
         </div>
       </section>
 
@@ -84,49 +145,65 @@
             <input type="file" id="resource-import-input" hidden />
           </div>
         </div>
-        <div class="card-grid" id="resource-grid"></div>
+        <div class="admin-list-toolbar" id="resource-toolbar" aria-label="资源搜索与筛选">
+          <label class="admin-search" for="resource-search"><span data-icon="search"></span><input id="resource-search" type="search" placeholder="搜索名称或描述" autocomplete="off" /><span class="sr-only">搜索当前模块</span></label>
+          <label class="admin-filter" for="resource-filter"><span>状态</span><select id="resource-filter"><option value="all">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option><option value="public">已公开</option></select></label>
+          <span class="admin-result-count" id="resource-count" role="status" aria-live="polite"></span>
+        </div>
+        <div class="card-grid" id="resource-grid" data-layout="cards"></div>
       </section>
     </main>
   </div>
 
-  <dialog id="agent-dialog">
-    <h3 id="agent-dialog-title">新建智能体</h3>
-    <label>名称</label><input id="agent-name" />
-    <label>用途说明</label><textarea id="agent-description"></textarea>
-    <label>开场白</label><input id="agent-opening" />
-    <label>系统指令</label><textarea id="agent-prompt" class="code-area"></textarea>
-    <label>模型提供商</label><select id="agent-provider"></select>
-    <fieldset class="routing-fieldset">
-      <legend>模型路由与故障切换</legend>
-      <label for="agent-route-strategy">路由策略</label>
-      <select id="agent-route-strategy">
-        <option value="fixed">固定主模型</option>
-        <option value="ordered">按顺序故障切换</option>
-        <option value="lowest_cost">健康候选中成本最低</option>
-      </select>
-      <label>备用 Provider（按勾选顺序）</label><div id="agent-provider-fallbacks" class="choice-grid"></div>
-      <div class="routing-health-grid">
-        <label>统计窗口（分钟）<input id="agent-health-lookback" type="number" min="1" max="10080" value="60" /></label>
-        <label>最少样本<input id="agent-health-min-samples" type="number" min="1" max="1000" value="3" /></label>
-        <label>最大错误率<input id="agent-health-error-rate" type="number" min="0.05" max="1" step="0.05" value="0.6" /></label>
-        <label>连续失败阈值<input id="agent-health-consecutive" type="number" min="1" max="100" value="3" /></label>
-      </div>
-      <small class="field-help">切换仅发生在尚未产生用户可见流式增量时；不会扩大 Provider 权限。</small>
-    </fieldset>
-    <label>Skills</label><div id="agent-skills" class="choice-grid"></div>
-    <label>MCP</label><div id="agent-mcp" class="choice-grid"></div>
-    <label>子智能体</label><div id="agent-children" class="choice-grid"></div>
-    <label>内置 Harness 能力</label><div id="agent-builtins" class="choice-grid"></div>
-    <div class="switch-row">
-      <label><input type="checkbox" id="agent-memory" /> 启用长期记忆</label>
-      <label><input type="checkbox" id="agent-public" /> 对用户开放</label>
-      <label><input type="checkbox" id="agent-enabled" checked /> 启用</label>
+  <dialog id="agent-dialog" class="agent-editor" aria-labelledby="agent-dialog-title">
+    <header class="agent-editor-header"><div><p class="agent-editor-eyebrow">智能体配置</p><h3 id="agent-dialog-title">新建智能体</h3><p>为不同任务选择合适的模型，统一管理指令与能力。</p></div><button type="button" class="icon-button" data-close="agent-dialog" aria-label="关闭智能体配置"><span data-icon="close"></span></button></header>
+    <nav class="agent-editor-tabs" role="tablist" aria-label="智能体配置分类">
+      <button type="button" role="tab" id="agent-tab-overview" data-agent-tab="overview" aria-controls="agent-section-overview" aria-selected="true">概览</button>
+      <button type="button" role="tab" id="agent-tab-models" data-agent-tab="models" aria-controls="agent-section-models" aria-selected="false" tabindex="-1">模型与路由</button>
+      <button type="button" role="tab" id="agent-tab-capabilities" data-agent-tab="capabilities" aria-controls="agent-section-capabilities" aria-selected="false" tabindex="-1">能力</button>
+    </nav>
+    <div class="agent-editor-content">
+      <section id="agent-section-overview" role="tabpanel" aria-labelledby="agent-tab-overview">
+        <div class="agent-form-grid"><div><label for="agent-name">名称</label><input id="agent-name" placeholder="例如：通用助手" required /></div><div><label for="agent-opening">开场白</label><input id="agent-opening" placeholder="开始对话时展示的一句话" /></div></div>
+        <label for="agent-description">用途说明</label><textarea id="agent-description" placeholder="这个智能体可以帮助用户完成什么？"></textarea>
+        <label for="agent-prompt">系统指令</label><textarea id="agent-prompt" class="code-area" placeholder="描述工作方式、边界和输出要求"></textarea>
+        <div class="switch-row"><label><input type="checkbox" id="agent-public" /> 对用户开放</label><label><input type="checkbox" id="agent-enabled" checked /> 启用智能体</label></div>
+      </section>
+      <section id="agent-section-models" role="tabpanel" aria-labelledby="agent-tab-models" hidden>
+        <div class="agent-section-heading"><h4>模型分工</h4><p>未指定的职责自动沿用本轮执行模型。</p></div>
+        <div class="model-roles-table" role="table" aria-label="模型职责">
+          <div class="model-role-heading" role="row"><span role="columnheader">职责</span><span role="columnheader">模型连接</span><span role="columnheader">运行方式</span></div>
+          <div class="model-role-row" role="row"><label for="agent-provider" role="cell">执行</label><div role="cell"><select id="agent-provider" aria-label="执行模型"></select></div><p role="cell">处理任务与生成结果</p></div>
+          <div id="agent-model-roles"></div>
+        </div>
+        <div class="agent-section-heading"><h4>路由与运行策略</h4></div>
+        <div class="agent-setting-row"><label for="agent-tool-routing">工具决策方式</label><div><select id="agent-tool-routing"><option value="deterministic">规则优先</option><option value="model">模型结构化判断</option></select><small class="field-help">模型路由仅从智能体已授权的工具中选择。</small></div></div>
+        <div class="agent-setting-row"><label for="agent-router-confidence">模型置信度门槛</label><div><input id="agent-router-confidence" type="number" min="0" max="1" step="0.05" value="0.7" /><small class="field-help">这是模型给出的估计值，未经统计校准；低于门槛时回退到规则判断。</small></div></div>
+        <div class="agent-setting-row"><label for="agent-planning-mode">规划触发</label><select id="agent-planning-mode"><option value="auto">自动判断任务复杂度</option><option value="always">每次任务都规划</option><option value="off">关闭规划</option></select></div>
+        <div class="agent-setting-row"><label for="agent-review-mode">验证触发</label><select id="agent-review-mode"><option value="on_failure">答复验证失败后检查与修订</option><option value="off">关闭模型修订，仍保留确定性验收</option></select></div>
+        <details class="agent-advanced"><summary>高级参数与模型故障切换</summary>
+          <div id="agent-role-parameters" class="agent-role-parameters"></div>
+          <p class="field-help">ChatGPT 订阅连接暂不支持阶段参数覆盖，请将推理强度保留为继承、输出上限留空；关闭输出上限参数的模型连接也不能覆盖输出上限。</p>
+          <fieldset class="routing-fieldset"><legend>执行模型路由</legend>
+            <div class="agent-form-grid"><div><label for="agent-route-mode">路由模式</label><select id="agent-route-mode"><option value="fixed">固定主模型</option><option value="rules">按规则匹配模型</option><option value="policy">健康与故障切换策略</option></select></div><div><label for="agent-route-strategy">候选选择策略</label><select id="agent-route-strategy"><option value="ordered">按备用列表顺序</option><option value="lowest_cost">健康候选中成本最低</option></select></div></div>
+            <label>备用模型顺序</label><p class="field-help">勾选加入候选，通过上移、下移调整实际切换顺序。</p><div id="agent-provider-fallbacks" class="fallback-list"></div>
+            <label class="agent-inline-checkbox"><input id="agent-health-enabled" type="checkbox" /> 启用健康检查</label>
+            <div class="routing-health-grid"><label for="agent-health-lookback">统计窗口（分钟）<input id="agent-health-lookback" type="number" min="1" max="10080" value="60" /></label><label for="agent-health-min-samples">最少样本<input id="agent-health-min-samples" type="number" min="1" max="1000" value="3" /></label><label for="agent-health-error-rate">最大错误率<input id="agent-health-error-rate" type="number" min="0.05" max="1" step="0.05" value="0.6" /></label><label for="agent-health-consecutive">连续失败阈值<input id="agent-health-consecutive" type="number" min="1" max="100" value="3" /></label></div>
+            <label for="agent-route-rules">高级匹配规则（JSON）</label><textarea id="agent-route-rules" class="code-area" spellcheck="false" aria-describedby="agent-route-rules-help"></textarea><small class="field-help" id="agent-route-rules-help">保留已有规则；不需要规则时使用 []。模型切换仅发生在尚未产生用户可见内容时。</small>
+          </fieldset>
+        </details>
+        <p class="agent-permission-note"><span data-icon="shield"></span>选择模型不会改变智能体的工具权限。</p>
+      </section>
+      <section id="agent-section-capabilities" role="tabpanel" aria-labelledby="agent-tab-capabilities" hidden>
+        <div class="agent-section-heading"><h4>工具与知识能力</h4><p>只启用当前智能体需要的能力。</p></div>
+        <label>Skills</label><div id="agent-skills" class="choice-grid"></div>
+        <label>MCP</label><div id="agent-mcp" class="choice-grid"></div>
+        <label>子智能体</label><div id="agent-children" class="choice-grid"></div>
+        <label>内置 Harness 能力</label><div id="agent-builtins" class="choice-grid"></div>
+        <div class="switch-row"><label><input type="checkbox" id="agent-memory" /> 启用长期记忆</label></div>
+      </section>
     </div>
-    <div class="error" id="agent-error"></div>
-    <div class="dialog-actions">
-      <button class="btn ghost" data-close="agent-dialog">取消</button>
-      <button class="btn" id="agent-save">保存并发布新版本</button>
-    </div>
+    <footer class="agent-editor-footer"><div class="error" id="agent-error" role="alert" aria-live="assertive"></div><div class="dialog-actions"><button type="button" class="btn ghost" data-close="agent-dialog">取消</button><button type="button" class="btn" id="agent-save">保存更改</button></div></footer>
   </dialog>
 
   <dialog id="provider-price-dialog" class="compact-dialog">
@@ -223,6 +300,13 @@
   </dialog>
 
   <script src="/static/common.js"></script>
+  <script src="/static/guardrail-notifications.js" defer></script>
+  <script src="/static/guardrails.js"></script>
+  <script src="/static/memory-admin.js"></script>
+  <script src="/static/services-admin.js"></script>
+  <script src="/static/agent-model-config.js"></script>
+  <script src="/static/provider-reasoning-config.js"></script>
+  <script src="/static/personal-settings.js"></script>
   <script src="/static/admin.js"></script>
 </body>
 </html>

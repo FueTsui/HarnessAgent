@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
+from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile, File, status
 from fastapi.responses import FileResponse, StreamingResponse
@@ -24,7 +25,16 @@ from ..approval_policy import (
     normalize as normalize_approval_policy,
 )
 from ..llm.client import LLMClient, client_for_provider
+from ..guest_access import (
+    PERSONAL_MODEL_PREFIX, effective_reasoning_provider, guest_agent, is_guest, personal_model_client,
+    reject_guest_resources, restrict_guest_snapshot, select_guest_provider, validate_guest_execution,
+)
 from ..model_governance import ProviderRoute, governed_client, resolve_route
+from ..model_roles import ROLE_NAMES, normalize_execution_options, validate_role_parameter_support
+from ..reasoning_options import (
+    apply_turn_reasoning, common_reasoning_capabilities, normalize_reasoning_config, normalize_turn_reasoning,
+    reasoning_capabilities, reasoning_profile_is_fixed,
+)
 from ..models import (
     Agent, Artifact, Attachment, Item, Job, JobGuidance, McpServer, ModelProvider, Project,
     ROLE_ADMIN, ROLE_ROOT, Skill, Template, Thread, Turn, User, iso_utc,
@@ -34,12 +44,17 @@ from ..capabilities import templates as templates_render
 from ..runtime import memory
 from ..runtime import builtin_tools
 from ..runtime import MAX_AGENT_DEPTH, TaskInput, run_harness
-from ..runtime.control import requires_document_artifact, requires_presentation_artifact
+from ..runtime.control import requires_document_artifact, requires_presentation_artifact, resolve_task_objective
 from ..runtime.evaluation import resolve_artifact_evaluation, resolve_plan_evaluation
 from ..runtime.orchestrator import CompletionVerificationError
 from ..runtime.policies import RuntimePolicies
+from ..runtime.process_view import (
+    is_public_process_event,
+    public_process_payload as _public_process_payload,
+    runtime_event_type,
+)
 from ..capabilities import knowledge
-from ..rate_limit import enforce
+from ..rate_limit import client_ip, enforce
 
 logger = logging.getLogger(__name__)
 from ..security import (
@@ -56,304 +71,6 @@ from .skills import artifact_template_ids
 router = APIRouter(prefix="/api/v1", tags=["对话"])
 
 
-_PUBLIC_PROCESS_EVENTS = {
-    "turn.progress", "plan.created", "plan.updated", "memory.resolved", "tools.routed",
-    "plan.closeout.started", "plan.closeout.completed",
-    "evidence.required", "verification.failed", "verification.completed",
-    "evaluation.started", "evaluation.completed",
-    "context.compacted", "guidance.claimed", "guidance.applied",
-    "interaction.interrupt.received", "interaction.redirect.queued",
-    "interaction.redirect.created", "interaction.redirect.applied",
-    "turn.started", "turn.completed", "loop.iteration.started", "loop.stopped",
-    "loop.completed", "loop.blocked", "task.queued", "task.started", "task.status",
-    "task.completed", "task.completed_with_issues", "task.failed", "task.cancelled",
-    "step.started",
-    "step.completed", "step.failed", "step.blocked", "step.skipped", "approval.requested",
-    "approval.granted", "approval.policy", "approval.auto_approved",
-    "attachments.resolved", "attachments.materialized",
-    "provider.routed", "provider.attempt", "provider.fallback",
-}
-
-
-def _public_process_payload(event_type: str, payload: dict) -> dict:
-    """只回放前端实际展示的安全字段，不把工具参数或模型内部推理发给浏览器。"""
-    def nonnegative_int(value) -> int:
-        try:
-            return max(0, int(value or 0))
-        except (TypeError, ValueError):
-            return 0
-
-    def public_plan_summary(value) -> dict:
-        source = value if isinstance(value, dict) else {}
-        result = {
-            key: nonnegative_int(source.get(key))
-            for key in (
-                "total", "completed", "failed", "blocked", "skipped",
-                "pending", "in_progress",
-            )
-        }
-        result["terminalized"] = bool(source.get("terminalized"))
-        result["all_completed"] = bool(source.get("all_completed"))
-        return result
-
-    def public_issues(value) -> list[str]:
-        source = value if isinstance(value, (list, tuple)) else []
-        return [
-            str(item)[:400] for item in source[:20]
-            if str(item).strip()
-        ]
-
-    def public_evaluation(value) -> dict:
-        source = value if isinstance(value, dict) else {}
-        selected = []
-        for item in (source.get("selected_skills") or [])[:12]:
-            if isinstance(item, dict):
-                selected.append({
-                    "name": str(item.get("name") or "")[:64],
-                    "label": str(item.get("label") or "")[:80],
-                    "version": str(item.get("version") or "")[:16],
-                    "reason": str(item.get("reason") or "")[:180],
-                })
-            else:
-                selected.append({"name": str(item)[:64]})
-        tree = source.get("evidence_tree") if isinstance(source.get("evidence_tree"), dict) else {}
-        children = []
-        for node in (tree.get("children") or [])[:12]:
-            if not isinstance(node, dict):
-                continue
-            checks = []
-            for check in (node.get("checks") or [])[:24]:
-                if not isinstance(check, dict):
-                    continue
-                checks.append({
-                    "id": str(check.get("id") or "")[:96],
-                    "label": str(check.get("label") or "")[:160],
-                    "status": str(check.get("status") or "unknown")[:16],
-                    "expected": str(check.get("expected") or "")[:240],
-                    "observed": str(check.get("observed") or "")[:400],
-                    "evidence_refs": [
-                        str(ref)[:160] for ref in (check.get("evidence_refs") or [])[:12]
-                    ],
-                })
-            children.append({
-                "id": str(node.get("id") or "")[:96],
-                "skill": str(node.get("skill") or "")[:64],
-                "label": str(node.get("label") or "")[:80],
-                "status": str(node.get("status") or "unknown")[:16],
-                "confidence": float(node.get("confidence") or 0),
-                "checks": checks,
-            })
-        summary = source.get("summary") if isinstance(source.get("summary"), dict) else {}
-        return {
-            "version": str(source.get("version") or "")[:16],
-            "objective": str(source.get("objective") or "")[:240],
-            "decision": str(source.get("decision") or "")[:24],
-            "score": nonnegative_int(source.get("score")),
-            "coverage": float(source.get("coverage") or 0),
-            "confidence": float(source.get("confidence") or 0),
-            "issue_count": nonnegative_int(source.get("issue_count")),
-            "selected_skills": selected,
-            "skill_gaps": [
-                str(item)[:96] for item in (source.get("skill_gaps") or [])[:12]
-            ],
-            "summary": {
-                key: nonnegative_int(summary.get(key))
-                for key in ("passed", "failed", "unknown")
-            },
-            "evidence_tree": {
-                "id": str(tree.get("id") or "evaluation-root")[:96],
-                "label": str(tree.get("label") or "任务完成评测")[:80],
-                "status": str(tree.get("status") or "unknown")[:16],
-                "children": children,
-            },
-        }
-
-    if event_type == "turn.progress":
-        return {"text": str(payload.get("text") or "")[:256]}
-    if event_type == "evaluation.started":
-        return {
-            "version": str(payload.get("version") or "")[:16],
-            "selected_skills": [
-                str(item.get("name") if isinstance(item, dict) else item)[:64]
-                for item in (payload.get("selected_skills") or [])[:12]
-            ],
-        }
-    if event_type == "evaluation.completed":
-        return public_evaluation(payload)
-    if event_type.startswith("interaction."):
-        return {
-            "mode": str(payload.get("mode") or "")[:24],
-            "interrupted_turn_id": str(payload.get("interrupted_turn_id") or "")[:32],
-            "successor_turn_id": str(payload.get("successor_turn_id") or "")[:32],
-            "chars": nonnegative_int(payload.get("chars")),
-            "cancelled_guidance": nonnegative_int(payload.get("cancelled_guidance")),
-        }
-    if event_type == "memory.resolved":
-        return {
-            "selected_count": nonnegative_int(payload.get("selected_count")),
-            "candidate_count": nonnegative_int(payload.get("candidate_count")),
-            "max_score": float(payload.get("max_score") or 0),
-            "influence": float(payload.get("influence") or 0),
-            "sources": [
-                {
-                    "turn_id": str(item.get("turn_id") or "")[:32],
-                    "thread_id": str(item.get("thread_id") or "")[:40],
-                    "thread_title": str(item.get("thread_title") or "")[:80],
-                    "score": float(item.get("score") or 0),
-                    "relevance": float(item.get("relevance") or 0),
-                }
-                for item in (payload.get("sources") or [])[:10]
-                if isinstance(item, dict)
-            ],
-        }
-    if event_type in {"plan.created", "plan.updated"}:
-        return {
-            "explanation": str(payload.get("explanation") or "")[:240],
-            "reason": str(payload.get("reason") or "")[:240],
-            "revision": nonnegative_int(payload.get("revision")),
-            "steps": [
-                {
-                    "id": str(item.get("id") or "")[:48],
-                    "step": str(item.get("step") or "")[:160],
-                    "status": str(item.get("status") or "pending")[:24],
-                }
-                for item in (payload.get("steps") or [])[:24]
-                if isinstance(item, dict)
-            ],
-        }
-    if event_type in {"plan.closeout.started", "plan.closeout.completed"}:
-        status_counts = payload.get("status_counts")
-        status_counts = status_counts if isinstance(status_counts, dict) else {}
-        result = {
-            "reason": str(payload.get("reason") or "")[:120],
-            "revision": nonnegative_int(payload.get("revision")),
-            "unfinished_steps": [
-                str(value)[:160] for value in (payload.get("unfinished_steps") or [])[:24]
-            ],
-        }
-        if "status_counts" in payload:
-            result["status_counts"] = {
-                key: nonnegative_int(status_counts.get(key))
-                for key in (
-                    "completed", "failed", "blocked", "skipped",
-                    "pending", "in_progress",
-                )
-            }
-        if event_type == "plan.closeout.completed":
-            for key in (
-                "applied", "resolved", "terminalized", "all_completed"
-            ):
-                if key in payload:
-                    result[key] = bool(payload.get(key))
-            if "outcome" in payload:
-                result["outcome"] = str(payload.get("outcome") or "")[:32]
-        return result
-    if event_type.startswith("step."):
-        return {
-            "step_id": str(payload.get("step_id") or "")[:48],
-            "step": str(payload.get("step") or "")[:160],
-            "status": str(payload.get("status") or "")[:24],
-            "revision": nonnegative_int(payload.get("revision")),
-        }
-    if event_type.startswith("task."):
-        result = {
-            "status": str(payload.get("status") or "")[:24],
-            "reason": str(payload.get("reason") or "")[:120],
-            "error": str(payload.get("error") or "")[:500],
-        }
-        if payload.get("completion_status"):
-            result["completion_status"] = str(
-                payload.get("completion_status") or ""
-            )[:24]
-        if "completion_issues" in payload:
-            result["completion_issues"] = public_issues(
-                payload.get("completion_issues")
-            )
-        if "plan_summary" in payload:
-            result["plan_summary"] = public_plan_summary(payload.get("plan_summary"))
-        return result
-    if event_type.startswith("approval."):
-        return {
-            "scope": str(payload.get("scope") or "")[:80],
-            "description": str(payload.get("description") or "")[:240],
-            "policy": str(payload.get("policy") or "")[:24],
-            "risk": str(payload.get("risk") or "")[:24],
-        }
-    if event_type.startswith("turn.") or event_type.startswith("loop."):
-        result = {
-            key: payload.get(key)
-            for key in (
-                "iteration", "reason", "checkpoint", "successful_tools",
-                "budgeted_successful_tools", "max_successful_calls", "max_iterations",
-                "completion_status",
-            )
-            if key in payload
-        }
-        if "completion_issues" in payload:
-            result["completion_issues"] = public_issues(
-                payload.get("completion_issues")
-            )
-        if "plan_summary" in payload:
-            result["plan_summary"] = public_plan_summary(payload.get("plan_summary"))
-        return result
-    if event_type.startswith("tool."):
-        return {
-            "tool": str(payload.get("tool") or "")[:80],
-            "targets": [str(value)[:180] for value in (payload.get("targets") or [])[:8]],
-            "ok": payload.get("ok") is not False,
-        }
-    if event_type.startswith("attachments."):
-        return {
-            "count": nonnegative_int(payload.get("count")),
-            "inherited": bool(payload.get("inherited")),
-            "continuation_of_turn_id": str(
-                payload.get("continuation_of_turn_id") or ""
-            )[:32],
-            "names": [str(value)[:255] for value in (payload.get("names") or [])[:10]],
-        }
-    if event_type.startswith("provider."):
-        result = {
-            key: payload.get(key)
-            for key in (
-                "provider_id", "planned_provider_id", "from_provider_id",
-                "to_provider_id", "attempt_index", "ok", "latency_ms",
-            )
-            if key in payload
-        }
-        for key in ("model", "from_model", "to_model", "route_reason", "reason"):
-            if key in payload:
-                result[key] = str(payload.get(key) or "")[:160]
-        if payload.get("fallback_provider_ids"):
-            result["fallback_provider_ids"] = [
-                nonnegative_int(value)
-                for value in (payload.get("fallback_provider_ids") or [])[:8]
-            ]
-        if payload.get("error_class"):
-            result["error_class"] = str(payload.get("error_class") or "")[:96]
-        return result
-    if event_type.startswith("verification."):
-        result = {
-            key: payload.get(key)
-            for key in (
-                "passed", "plan_passed", "provisional", "hard_failure",
-                "repairable", "revisions", "revision", "completion_status",
-            )
-            if key in payload
-        }
-        if payload.get("issues"):
-            result["issues"] = public_issues(payload.get("issues"))
-        if "plan_summary" in payload:
-            result["plan_summary"] = public_plan_summary(payload.get("plan_summary"))
-        return result
-    return {
-        key: payload.get(key)
-        for key in (
-            "selected_count", "offered", "passed", "provisional", "guidance_id", "mode"
-        )
-        if key in payload
-    }
-
-
 def _run_processes(db: Session, rows: list[Job]) -> dict[str, dict]:
     """把持久 Item 整理成可供过程面板回放的安全摘要。"""
     if not rows:
@@ -368,26 +85,22 @@ def _run_processes(db: Session, rows: list[Job]) -> dict[str, dict]:
     task_status_by_run: dict[str, str] = {}
     latest_plan_by_run: dict[str, list[dict]] = {}
     for event in events:
-        event_type = event.name
-        if not (
-            event_type in _PUBLIC_PROCESS_EVENTS
-            or event_type.startswith("turn.")
-            or event_type.startswith("loop.")
-            or event_type.startswith("tool.")
-        ):
-            continue
         try:
             payload = json.loads(event.payload or "{}")
         except json.JSONDecodeError:
             payload = {}
         if not isinstance(payload, dict):
             payload = {}
+        event_type = runtime_event_type(event, payload)
+        if not is_public_process_event(event_type):
+            continue
         public_payload = _public_process_payload(event_type, payload)
-        if event_type in {"plan.created", "plan.updated"}:
+        is_parent_event = payload.get("execution_scope") != "inline_subagent"
+        if is_parent_event and event_type in {"plan.created", "plan.updated"}:
             latest_plan_by_run[event.turn_id] = list(
                 public_payload.get("steps") or []
             )
-        if event_type.startswith("task.") and public_payload.get("status"):
+        if is_parent_event and event_type.startswith("task.") and public_payload.get("status"):
             task_status_by_run[event.turn_id] = public_payload["status"]
         by_run[event.turn_id].append({
             "task_id": event.turn_id,
@@ -449,18 +162,15 @@ def _persisted_events_after(task_id: str, revision: int) -> list[dict]:
         )
         events = []
         for item in rows:
-            event_type = item.name
-            if not (
-                event_type in _PUBLIC_PROCESS_EVENTS
-                or event_type.startswith("turn.")
-                or event_type.startswith("loop.")
-                or event_type.startswith("tool.")
-            ):
-                continue
             try:
                 payload = json.loads(item.payload or "{}")
             except json.JSONDecodeError:
                 payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            event_type = runtime_event_type(item, payload)
+            if not is_public_process_event(event_type):
+                continue
             events.append({
                 "task_id": item.turn_id,
                 "event_id": item.id,
@@ -708,6 +418,16 @@ _PPTX_UNAVAILABLE_LINE_RE = re.compile(
 )
 
 
+def _normalize_export_links(answer: str, filenames: list[str]) -> str:
+    """Use same-origin download links only for this run's actual artifacts."""
+    allowed = set(filenames or [])
+
+    def normalize(match):
+        return match.group(1) if unquote(match.group(2)) in allowed else match.group(0)
+
+    return re.sub(r"sandbox:(/api/v1/exports/([^\s)<>]+))", normalize, answer or "")
+
+
 def _prefer_template_artifacts(answer: str, builtin_artifacts, template_exports):
     """Prefer template-derived files and make the answer link to each one."""
     template_exports = list(template_exports or [])
@@ -871,6 +591,12 @@ def _project_dataset_ids(project: Project | None) -> list[str]:
 def _validate_project_resources(
     db: Session, user: User, default_agent_id, dataset_ids
 ) -> tuple[int | None, list[str]]:
+    if is_guest(user):
+        reject_guest_resources(user, dataset_ids=dataset_ids)
+        selected = guest_agent(db, user)
+        if default_agent_id is not None and int(default_agent_id) != selected.id:
+            raise HTTPException(404, "项目默认智能体不存在或不可用")
+        return selected.id if default_agent_id is not None else None, []
     agent_id = None
     if default_agent_id is not None:
         try:
@@ -915,7 +641,7 @@ def _project_public(row: Project, db: Session, user_id: int) -> dict:
 def _project_execution_snapshot(project: Project | None, user: User) -> dict:
     if project is None:
         return {}
-    visible = {item["key"] for item in knowledge.list_datasets(user)}
+    visible = set() if is_guest(user) else {item["key"] for item in knowledge.list_datasets(user)}
     return {
         "project_id": project.id,
         "name": project.name,
@@ -1056,6 +782,9 @@ def resolve_agent_descriptor(db: Session, agent: Agent, depth: int = 0) -> dict:
     desc["mcp_servers"] = agent_mcp_servers(db, agent)
     desc["sub_agents"] = agent_sub_descriptors(db, agent, depth)
     desc["builtin_tools"] = sorted(builtin_tools.effective_tool_names(db, agent))
+    stage_snapshot = _stage_model_snapshot(db, agent, _provider_snapshot(provider))
+    desc["model_execution"] = stage_snapshot["model_execution"]
+    desc["role_clients"] = _role_clients_from_execution_snapshot(stage_snapshot, db)
     return desc
 
 
@@ -1085,7 +814,7 @@ _PROVIDER_SNAPSHOT_FIELDS = (
     "model_name", "model_reasoning", "model_input", "context_window",
     "auth_extra", "wire_api", "auth_type",
     "auth_header", "api_version", "api_version_mode", "custom_headers",
-    "extra_body", "model_list_path", "reasoning_effort", "max_tokens",
+    "extra_body", "model_list_path", "reasoning_effort", "reasoning_config", "max_tokens",
     "max_tokens_param", "timeout_ms", "max_retries", "stream_max_retries",
     "stream_idle_timeout_ms", "supports_temperature",
 )
@@ -1110,11 +839,22 @@ def _provider_snapshot(provider: ModelProvider | None) -> dict:
             "auth_type": "bearer",
             "custom_headers": "{}",
             "extra_body": "{}",
+            "reasoning_config": "{}",
         }
-    return {
+    result = {
         field: getattr(provider, field, None)
         for field in _PROVIDER_SNAPSHOT_FIELDS
     }
+    if (normalize_reasoning_config(result.get("reasoning_config")).get("mode") == "off"
+            or reasoning_profile_is_fixed(result)):
+        # Stored defaults remain editable, but public execution evidence reflects
+        # that this frozen profile sends no reasoning override.
+        result["reasoning_effort"] = ""
+    if str(result.get("name") or "").startswith(PERSONAL_MODEL_PREFIX):
+        result["max_tokens"] = min(8192, int(result.get("max_tokens") or 8192))
+        result["max_tokens_param"] = "auto"
+        result["extra_body"] = "{}"
+    return result
 
 
 def _mcp_snapshot(server: McpServer) -> dict:
@@ -1125,8 +865,49 @@ def _mcp_snapshot(server: McpServer) -> dict:
         "transport": server.transport,
         "url": server.url,
         "headers": server.headers,
+        "command": getattr(server, "command", ""),
+        "args": getattr(server, "args", "[]"),
+        "env": getattr(server, "env", "{}"),
+        "cwd": getattr(server, "cwd", ""),
+        "stdio_authorized": bool(getattr(server, "stdio_authorized", False)),
         "risk_policy": str(getattr(server, "risk_policy", "auto") or "auto"),
     }
+
+
+def _stage_model_snapshot(db: Session, agent: Agent, primary: dict) -> dict:
+    """Freeze role settings and credentials with the same turn as the executor."""
+    try:
+        routing = json.loads(agent.routing or "{}")
+        options = normalize_execution_options(routing)
+    except (ValueError, TypeError):
+        options = normalize_execution_options({})
+    owner = db.get(User, agent.created_by) if agent.created_by else None
+    models = {}
+    for name in ROLE_NAMES:
+        spec = options["roles"][name]
+        provider_id = spec["provider_id"]
+        if provider_id is None and not spec["reasoning_effort"] and spec["max_tokens"] is None:
+            continue
+        selected = dict(primary)
+        if provider_id is not None:
+            provider = db.get(ModelProvider, provider_id)
+            if (provider is None or not provider.enabled or not provider.model_id
+                    or owner is None or not owner.is_active or not can_use(owner, provider)):
+                # A disabled/deleted/revoked reference never creates a role client.
+                continue
+            selected = _provider_snapshot(provider)
+        try:
+            validate_role_parameter_support(selected, spec, name)
+            if spec["max_tokens"] is not None:
+                selected["max_tokens"] = spec["max_tokens"]
+                if str(selected.get("name") or "").startswith(PERSONAL_MODEL_PREFIX):
+                    selected["max_tokens"] = min(8192, selected["max_tokens"])
+            selected = apply_turn_reasoning(selected, spec["reasoning_effort"])
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        models[name] = {"provider": selected, "owner_id": agent.created_by,
+                        "explicit_provider": provider_id is not None}
+    return {"model_execution": options, "model_roles": models}
 
 
 def _build_agent_execution_snapshot(
@@ -1139,6 +920,7 @@ def _build_agent_execution_snapshot(
     extra_agent_ids=None,
     selected_provider: ModelProvider | None = None,
     selected_route: ProviderRoute | None = None,
+    reasoning_effort: str = "",
     depth: int = 0,
 ) -> dict:
     version = harness_registry.active_version(db, agent)
@@ -1165,6 +947,14 @@ def _build_agent_execution_snapshot(
     else:
         route = resolve_route(db, agent, query)
     provider = route.primary
+    # A requested effort is validated for every frozen fallback as well. A
+    # fallback must not silently discard or lower the user's per-turn choice.
+    try:
+        provider_config = apply_turn_reasoning(_provider_snapshot(provider), reasoning_effort)
+        fallback_configs = [apply_turn_reasoning(_provider_snapshot(candidate), reasoning_effort)
+                            for candidate in route.fallbacks]
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     selected_sub_ids = list(dict.fromkeys([
         *_agent_id_list(agent),
         *((extra_agent_ids or []) if depth == 0 else []),
@@ -1188,11 +978,10 @@ def _build_agent_execution_snapshot(
             "memory_enabled": bool(agent.memory_enabled),
         },
         "harness": version_data,
-        "provider": _provider_snapshot(provider),
+        "provider": provider_config,
         "provider_route": route.public(),
-        "provider_fallbacks": [
-            _provider_snapshot(candidate) for candidate in route.fallbacks
-        ],
+        "provider_fallbacks": fallback_configs,
+        **_stage_model_snapshot(db, agent, provider_config),
         "skills": agent_skills(db, agent, extra_skill_ids if depth == 0 else None),
         "mcp_servers": [
             _mcp_snapshot(server)
@@ -1216,8 +1005,35 @@ def build_execution_snapshot(
     provider: ModelProvider | None = None,
     provider_route: ProviderRoute | None = None,
     approval_policy: str = "ask",
+    reasoning_effort: str = "",
+    user: User | None = None,
 ) -> dict:
     """在入队事务中固化本次执行的完整 Harness 与能力配置。"""
+    try:
+        reasoning_effort = normalize_turn_reasoning(reasoning_effort)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    if is_guest(user):
+        selected = provider_route.primary if provider_route is not None else provider
+        if selected is None:
+            raise HTTPException(400, "暂无可用模型，请添加个人模型接口")
+        try:
+            provider_config = apply_turn_reasoning(_provider_snapshot(selected), reasoning_effort)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        snapshot = {
+            "agent": {"id": agent.id},
+            "harness": {"agent_id": agent.id, "version": agent.active_version,
+                        "loop": harness_registry.DEFAULT_LOOP,
+                        "verification_policy": harness_registry.DEFAULT_VERIFICATION_POLICY,
+                        "output_policy": harness_registry.DEFAULT_OUTPUT_POLICY},
+            "provider": provider_config,
+            "provider_route": ProviderRoute(primary=selected, reason="guest_explicit").public(),
+            "reasoning_effort": reasoning_effort,
+        }
+        snapshot = restrict_guest_snapshot(snapshot, user)
+        validate_guest_execution(db, user, agent, snapshot)
+        return snapshot
     snapshot = _build_agent_execution_snapshot(
         db,
         agent,
@@ -1227,8 +1043,10 @@ def build_execution_snapshot(
         extra_agent_ids=invoked_agent_ids,
         selected_provider=provider,
         selected_route=provider_route,
+        reasoning_effort=reasoning_effort,
     )
     snapshot["approval_policy"] = normalize_approval_policy(approval_policy)
+    snapshot["reasoning_effort"] = reasoning_effort
     return snapshot
 
 
@@ -1237,6 +1055,8 @@ def _provider_from_snapshot(value: dict):
 
 
 def _client_from_provider_snapshot(value: dict):
+    if str(value.get("name") or "").startswith(PERSONAL_MODEL_PREFIX):
+        return personal_model_client(_provider_from_snapshot(value))
     if value.get("is_environment_default"):
         return LLMClient(
             base_url=value.get("base_url", ""),
@@ -1245,6 +1065,9 @@ def _client_from_provider_snapshot(value: dict):
             model_input=["text"],
             vision_model_id=value.get("vision_model_id", ""),
             context_window=int(value.get("context_window") or 0),
+            reasoning_effort=value.get("reasoning_effort") or "",
+            reasoning_config=value.get("reasoning_config") or {},
+            max_tokens=int(value.get("max_tokens") or 8192),
             enforce_ssrf=False,
         )
     return client_for_provider(_provider_from_snapshot(value))
@@ -1262,7 +1085,32 @@ def _client_from_execution_snapshot(value: dict, runtime_event=None):
     )
 
 
-def _hydrate_sub_agent_snapshot(value: dict) -> dict:
+def _role_clients_from_execution_snapshot(value: dict, db: Session | None = None) -> dict:
+    clients = {}
+    models = value.get("model_roles") or {}
+    for name in ROLE_NAMES:
+        item = models.get(name)
+        if not isinstance(item, dict) or not isinstance(item.get("provider"), dict):
+            continue
+        provider = item["provider"]
+        if db is not None and item.get("explicit_provider"):
+            # Revalidate live authorization when the queued snapshot starts. The
+            # model/config itself stays frozen; permission revocation still wins.
+            live = db.get(ModelProvider, provider.get("id"))
+            owner = db.get(User, item.get("owner_id")) if item.get("owner_id") else None
+            if (live is None or not live.enabled or owner is None or not owner.is_active
+                    or not can_use(owner, live)):
+                continue
+        try:
+            clients[name] = _client_from_provider_snapshot(provider)
+        except (ValueError, TypeError, RuntimeError):
+            # Malformed/stale optional role configuration must not remove the
+            # already-authorized executor. No upstream response is logged here.
+            logger.warning("阶段模型配置不可用，继承执行模型：%s", name)
+    return clients
+
+
+def _hydrate_sub_agent_snapshot(value: dict, db: Session | None = None) -> dict:
     harness = value.get("harness") or {}
     agent = value.get("agent") or {}
     return {
@@ -1271,6 +1119,8 @@ def _hydrate_sub_agent_snapshot(value: dict) -> dict:
         "description": agent.get("description", ""),
         "type": "harness",
         "llm": _client_from_execution_snapshot(value),
+        "model_execution": value.get("model_execution") or {},
+        "role_clients": _role_clients_from_execution_snapshot(value, db),
         "system_prompt": harness.get("system_prompt", ""),
         "tool_policy": harness.get("tool_policy", {}),
         "memory_policy": harness.get("memory_policy", {}),
@@ -1284,7 +1134,7 @@ def _hydrate_sub_agent_snapshot(value: dict) -> dict:
             SimpleNamespace(**row) for row in (value.get("mcp_servers") or [])
         ],
         "sub_agents": [
-            _hydrate_sub_agent_snapshot(row)
+            _hydrate_sub_agent_snapshot(row, db)
             for row in (value.get("sub_agents") or [])
         ],
         "builtin_tools": list(value.get("builtin_tools") or []),
@@ -1324,6 +1174,9 @@ def _build_memory(
         ),
         agent_id=agent.id if policies.memory_scope == "agent" else None,
     )
+    history.extend(memory.load_explicit_history(
+        db, user_id, session_id=session_id, agent_id=agent.id,
+    ))
     selected = memory.select_recall(
         history,
         query,
@@ -1420,12 +1273,19 @@ async def execute_chat(
     """
     chat_user = db.get(User, user_id) if user_id else None
     snapshot = execution_snapshot if isinstance(execution_snapshot, dict) else None
+    visitor = is_guest(chat_user)
+    if visitor:
+        reject_guest_resources(chat_user, skill_ids=skill_ids, mcp_ids=mcp_ids,
+                               agent_ids=invoked_agent_ids, template_ids=template_ids, dataset_ids=dataset_ids)
+        validate_guest_execution(db, chat_user, agent, snapshot)
+        snapshot = restrict_guest_snapshot(snapshot, chat_user)
     selected_approval_policy = normalize_approval_policy(
         (snapshot or {}).get("approval_policy") or approval_policy
     )
     if snapshot:
         provider_config = snapshot.get("provider") or {}
         llm = _client_from_execution_snapshot(snapshot, runtime_event=runtime_event)
+        stage_snapshot = snapshot
     else:
         route = select_chat_provider_route(
             db, chat_user, agent, provider_id, inputs.query,
@@ -1440,6 +1300,11 @@ async def execute_chat(
             runtime_event=runtime_event,
             reason=route.reason,
         )
+        stage_snapshot = _stage_model_snapshot(db, agent, provider_config)
+    model_execution = stage_snapshot.get("model_execution") or {}
+    role_clients = _role_clients_from_execution_snapshot(stage_snapshot, db)
+    from ..guardrail_policies import guard_model_client
+    llm = guard_model_client(llm, user_id=user_id, agent_id=agent.id, runtime_event=runtime_event)
     route_snapshot = (snapshot or {}).get("provider_route") or (
         route.public() if not snapshot else {}
     )
@@ -1450,6 +1315,7 @@ async def execute_chat(
                 route_snapshot.get("fallback_provider_ids") or []
             )[:8],
             "route_reason": str(route_snapshot.get("reason") or "fixed")[:160],
+            "reasoning_effort": str(provider_config.get("reasoning_effort") or ""),
         })
         if asyncio.iscoroutine(event_value):
             await event_value
@@ -1514,7 +1380,21 @@ async def execute_chat(
             pass
     # 对话附件：文档/代码提取文本 + 图片经视觉识别成文本，合并为「附件内容」上下文
     attach_parts: list[str] = []
-    doc_text = extract_attachment_text(attachment_docs, workspace_attachments)
+    from ..runtime.presentation_requirements import build_presentation_requirements_async, enrich_presentation_visual_sources
+    presentation_requirements = None if visitor else await build_presentation_requirements_async(
+        resolve_task_objective(inputs.query, history), attachment_docs,
+        {str(Path(path).resolve()): _attachment_display_name(Path(path)) for path in attachment_docs or []},
+    )
+    presentation_requirements = await enrich_presentation_visual_sources(
+        presentation_requirements, llm, progress=progress, runtime_event=runtime_event,
+    )
+    if presentation_requirements is not None:
+        # 保留 PDF 分页，避免之前合并/截断正文后仅生成第一页却仍被判为成功。
+        attach_parts.append(presentation_requirements.context())
+    doc_text = extract_attachment_text(
+        [path for path in attachment_docs or [] if presentation_requirements is None or Path(path).suffix.lower() != ".pdf"],
+        workspace_attachments,
+    )
     if doc_text:
         attach_parts.append(doc_text)
     img_text = await describe_attachment_images(llm, attachment_images, inputs.query, progress)
@@ -1547,7 +1427,7 @@ async def execute_chat(
         if snapshot else agent_mcp_servers(db, agent, mcp_ids)
     )
     sub_agents = (
-        [_hydrate_sub_agent_snapshot(row) for row in (snapshot.get("sub_agents") or [])]
+        [_hydrate_sub_agent_snapshot(row, db) for row in (snapshot.get("sub_agents") or [])]
         if snapshot else agent_sub_descriptors(db, agent, extra_ids=invoked_agent_ids)
     )
     user = db.get(User, user_id) if user_id else None
@@ -1577,12 +1457,15 @@ async def execute_chat(
         & builtin_tools.globally_enabled_names(db)
         if snapshot else builtin_tools.effective_tool_names(db, agent)
     )
-    if any(Path(value).suffix.lower() == ".docx" for value in (attachment_docs or [])):
+    if not visitor and any(Path(value).suffix.lower() == ".docx" for value in (attachment_docs or [])):
         assigned_tools |= {
             "document_inspect", "document_format",
         } & builtin_tools.globally_enabled_names(db)
-    document_requested = requires_document_artifact(inputs.query)
-    presentation_requested = requires_presentation_artifact(inputs.query)
+    task_objective = resolve_task_objective(inputs.query, history)
+    document_requested = not visitor and requires_document_artifact(task_objective)
+    presentation_requested = not visitor and requires_presentation_artifact(task_objective)
+    if presentation_requested:
+        assigned_tools |= {"presentation_create"} & builtin_tools.globally_enabled_names(db)
     for raw_template_id in template_ids or []:
         try:
             selected_template = db.get(Template, int(raw_template_id))
@@ -1594,6 +1477,12 @@ async def execute_chat(
         # 产物意图本身就是一次显式能力请求。旧 Agent 快照可能早于
         # document_create 能力，仍应在全局开关允许时获得该工具。
         assigned_tools |= {"document_create"} & builtin_tools.globally_enabled_names(db)
+    async def persist_generated_artifact(filename: str) -> None:
+        from ..artifacts import register_generated
+        await asyncio.to_thread(
+            register_generated, owner_id=user_id, run_id=run_id, filename=filename,
+        )
+
     builtin_context = builtin_tools.BuiltinToolContext(
         root=run_workspace,
         user_id=user_id,
@@ -1607,11 +1496,13 @@ async def execute_chat(
         approval_tokens=list(approval_tokens or []),
         approval_policy=selected_approval_policy,
         execution_id=run_id,
+        artifact_callback=persist_generated_artifact if run_id and user_id else None,
         enabled_tools=assigned_tools,
         attachment_images=materialized_images,
         active_skill_names=active_skill_names,
         required_artifact_kinds={"document"} if document_requested else set(),
         deferred_artifact_kinds={"presentation"} if presentation_requested else set(),
+        presentation_requirements=presentation_requirements,
     )
     if runtime_event:
         event_value = runtime_event("approval.policy", {
@@ -1628,6 +1519,8 @@ async def execute_chat(
             skills=skills,
             mcp_servers=mcp_servers,
             sub_agents=sub_agents,
+            model_execution=model_execution,
+            role_clients=role_clients,
             memory=mem,
             progress=progress,
             skill_builder=skill_builder,
@@ -1637,6 +1530,7 @@ async def execute_chat(
             attachment_text=attachment_text,
             template_context=template_context,
             invocation_context="、".join(invoked),
+            preferred_mcp_ids=selected_mcp_ids,
             tool_policy=version_config.get("tool_policy", {}),
             memory_policy=version_config.get("memory_policy", {}),
             verification_policy=version_config.get("verification_policy", {}),
@@ -1673,6 +1567,7 @@ async def execute_chat(
         builtin_context.artifacts,
         template_exports,
     )
+    answer = _normalize_export_links(answer, export_files)
     if presentation_requested:
         from ..artifacts import inspect_presentation_artifact, valid_presentation_artifact
 
@@ -1691,6 +1586,15 @@ async def execute_chat(
                 asyncio.to_thread(inspect_presentation_artifact, filename)
                 for filename in valid_exports
             ])
+            from ..runtime.presentation_requirements import inspect_presentation_requirements
+            for filename, report in zip(valid_exports, quality_reports):
+                coverage = await asyncio.to_thread(
+                    inspect_presentation_requirements, filename, presentation_requirements, builtin_tools.EXPORT_DIR,
+                )
+                report["source_coverage"] = coverage
+                if not coverage["valid"]:
+                    report["valid"] = False
+                    report["issues"] = [*(report.get("issues") or []), *coverage["issues"]]
         quality_issues = [
             f"{filename}：{issue}"
             for filename, report in zip(valid_exports, quality_reports)
@@ -1801,6 +1705,11 @@ async def execute_chat(
             event_value = runtime_event("evaluation.completed", evaluation)
             if asyncio.iscoroutine(event_value):
                 await event_value
+    from ..guardrail_policies import enforce_content
+    await enforce_content(
+        "model_output", answer, user_id=user_id, agent_id=agent.id,
+        provider_id=getattr(llm, "provider_id", None) or provider_config.get("id"), runtime_event=runtime_event,
+    )
     return answer, export_files, reasoning, completion_metadata
 
 
@@ -1837,6 +1746,11 @@ async def make_conversation_title(db: Session, agent: Agent, query: str, answer:
 
 
 def resolve_agent(db: Session, agent_id: Optional[int], user: User) -> Agent:
+    if is_guest(user):
+        selected = guest_agent(db, user)
+        if agent_id is not None and agent_id != selected.id:
+            raise HTTPException(404, "智能体不存在或不可用")
+        return selected
     if agent_id is None:
         # 未指定时优先默认智能体，否则选择当前主体可见的首个启用智能体。
         agent = db.query(Agent).filter(
@@ -1878,6 +1792,14 @@ def select_chat_provider_route(
     required_modalities=("text",),
 ) -> ProviderRoute:
     """Resolve an auditable route; an explicit user choice never adds fallback."""
+    if is_guest(user):
+        provider = select_guest_provider(db, user, provider_id)
+        if provider is None:
+            raise ValueError("暂无公开模型，请先添加个人模型接口")
+        modalities = set(json.loads(provider.model_input or '["text"]'))
+        if not set(required_modalities).issubset(modalities):
+            raise ValueError("选择的模型不支持本次输入类型")
+        return ProviderRoute(primary=provider, reason="guest_explicit")
     if provider_id is None:
         return resolve_route(
             db, agent, query, required_modalities=required_modalities
@@ -1885,9 +1807,41 @@ def select_chat_provider_route(
     provider = db.get(ModelProvider, int(provider_id))
     if provider is None or not provider.enabled or not provider.model_id:
         raise ValueError("选择的模型不存在、未配置或已停用")
-    if user is None or not bool(getattr(provider, "is_public", False)):
-        raise ValueError("该模型未开放给对话用户")
+    if user is None or not can_use(user, provider):
+        raise ValueError("该模型未开放给当前用户")
     return ProviderRoute(primary=provider, reason="explicit_user")
+
+
+def _agent_reasoning_capabilities(db: Session, agent: Agent) -> dict:
+    """Conservative intersection across all possible configured executor routes."""
+    try:
+        routing = json.loads(agent.routing or "{}")
+    except (TypeError, ValueError):
+        routing = {}
+    routing = routing if isinstance(routing, dict) else {}
+    ids = {agent.provider_id}
+    if routing.get("mode") in {"rules", "policy"}:
+        if routing.get("default_provider_id"):
+            ids.add(routing["default_provider_id"])
+        ids.update(rule.get("provider_id") for rule in (routing.get("rules") or []) if isinstance(rule, dict))
+    if routing.get("mode") == "policy":
+        ids.update(routing.get("fallback_provider_ids") or [])
+    providers = [db.get(ModelProvider, provider_id) if provider_id else None for provider_id in ids]
+    candidates = [provider for provider in providers if provider is None or (provider.enabled and provider.model_id)]
+    return common_reasoning_capabilities([effective_reasoning_provider(provider) for provider in candidates])
+
+
+def _chat_model_display_name(provider: ModelProvider | None) -> str:
+    """Keep the visible label independent from the model ID sent to the provider."""
+    if provider is None:
+        return settings.LLM_TEXT_MODEL
+    model_name = (provider.model_name or "").strip()
+    if model_name:
+        return model_name
+    name = (provider.name or "").strip()
+    if name and not name.startswith(PERSONAL_MODEL_PREFIX):
+        return name
+    return provider.model_id
 
 
 @router.get("/chat/models")
@@ -1902,10 +1856,29 @@ def chat_models(
         provider
         for provider in db.query(ModelProvider).filter(
             ModelProvider.enabled.is_(True),
-            ModelProvider.is_public.is_(True),
         ).order_by(ModelProvider.name, ModelProvider.id)
-        if provider.model_id
+        if provider.model_id and can_use(user, provider)
     ]
+    if is_guest(user):
+        default_provider = select_guest_provider(db, user)
+        return {
+            "available": default_provider is not None,
+            "default": {
+                "provider_id": default_provider.id if default_provider else None,
+                "name": _chat_model_display_name(default_provider) if default_provider else "暂无可用模型",
+                "model": default_provider.model_id if default_provider else "",
+                "model_name": _chat_model_display_name(default_provider) if default_provider else "",
+                "available": default_provider is not None,
+                **reasoning_capabilities(effective_reasoning_provider(default_provider)),
+            },
+            "items": [{
+                "provider_id": row.id, "name": _chat_model_display_name(row), "model": row.model_id,
+                "model_name": _chat_model_display_name(row),
+                "input": json.loads(row.model_input or '["text"]'),
+                "reasoning": bool(row.model_reasoning), "provider_type": row.provider_type,
+                **reasoning_capabilities(effective_reasoning_provider(row)),
+            } for row in providers],
+        }
     default_provider = resolve_provider(db, agent, "")
     return {
         "default": {
@@ -1916,16 +1889,19 @@ def chat_models(
                 if default_provider is not None
                 else settings.LLM_TEXT_MODEL
             ),
+            "model_name": _chat_model_display_name(default_provider),
+            **_agent_reasoning_capabilities(db, agent),
         },
         "items": [
             {
                 "provider_id": provider.id,
-                "name": provider.name,
+                "name": _chat_model_display_name(provider) if provider.name.startswith(PERSONAL_MODEL_PREFIX) else provider.name,
                 "model": provider.model_id,
-                "model_name": provider.model_name or provider.model_id,
+                "model_name": _chat_model_display_name(provider),
                 "input": json.loads(provider.model_input or '["text"]'),
                 "reasoning": bool(provider.model_reasoning),
                 "provider_type": provider.provider_type,
+                **reasoning_capabilities(effective_reasoning_provider(provider)),
             }
             for provider in providers
         ],
@@ -1967,6 +1943,7 @@ def _validate_invocations(
     invoked_agent_ids: list[int],
 ) -> None:
     """校验每轮斜杠调用；绑定能力对该智能体的用户可用，额外能力须公开/自有。"""
+    reject_guest_resources(user, skill_ids=skill_ids, mcp_ids=mcp_ids, agent_ids=invoked_agent_ids)
     bound_skills = _bound_capability_ids(agent, "skill_ids")
     bound_mcp = _bound_capability_ids(agent, "mcp_ids")
     bound_agents = _bound_capability_ids(agent, "agent_ids")
@@ -2005,6 +1982,8 @@ def _submission_response(job: jobs.JobView) -> dict:
         "session_id": str(payload.get("session_id") or ""),
         "attachments": list(payload.get("attachment_context") or []),
         "continuation_of_turn_id": payload.get("continuation_of_turn_id"),
+        "provider_id": payload.get("provider_id"),
+        "reasoning_effort": str(payload.get("reasoning_effort") or ""),
         "approval_policy": normalize_approval_policy(
             payload.get("approval_policy") or "ask"
         ),
@@ -2050,6 +2029,9 @@ async def chat(
     任务状态落库（jobs 表），由 worker（进程内或独立进程）领取执行，跨重启不丢。
     """
     enforce("chat-user", str(user.id), settings.CHAT_RATE_LIMIT, settings.CHAT_RATE_WINDOW_SECONDS)
+    if is_guest(user):
+        enforce("chat-guest-ip", client_ip(request), settings.CHAT_RATE_LIMIT,
+                settings.CHAT_RATE_WINDOW_SECONDS)
     idempotency_key = (request.headers.get("Idempotency-Key") or "").strip()
     if len(idempotency_key) > 128:
         raise HTTPException(
@@ -2095,8 +2077,9 @@ async def chat(
     raw_provider_id = _form_text(form, "provider_id")
     try:
         provider_id = int(raw_provider_id) if raw_provider_id else None
+        reasoning_effort = normalize_turn_reasoning(_form_text(form, "reasoning_effort"))
     except ValueError:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "模型参数无效")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "模型或推理强度参数无效；请选择当前模型目录提供的值")
     # 对话附件：通用「文件上传后据文件/描述问答」。须在请求内落盘（UploadFile 绑定本请求）。
     attachment_images, attachment_docs = await save_chat_attachments(_form_files(form, "attachments"))
     # 此时尚未做线程附件继承，因此这里只包含本次 HTTP 请求新落盘的文件。
@@ -2197,6 +2180,8 @@ async def chat(
         *project_context.get("dataset_ids", []),
         *dataset_ids,
     ]))[:20]
+    reject_guest_resources(user, skill_ids=skill_ids, mcp_ids=mcp_ids, agent_ids=invoked_agent_ids,
+                           template_ids=template_ids, dataset_ids=dataset_ids)
     _validate_invocations(db, user, agent, skill_ids, mcp_ids, invoked_agent_ids)
     # Artifact Template Skill 是一个可执行模板能力；用户选择 Skill 即自动选择其
     # 已注册模板，不再要求前端同时传入一份重复的 template_ids。
@@ -2209,6 +2194,13 @@ async def chat(
             db, user, agent, provider_id, inputs.query,
             required_modalities=("text", "image") if attachment_images else ("text",),
         )
+        if reasoning_effort:
+            capability = (
+                _agent_reasoning_capabilities(db, agent) if provider_id is None and not is_guest(user)
+                else reasoning_capabilities(effective_reasoning_provider(selected_route.primary))
+            )
+            if reasoning_effort not in capability["reasoning_efforts"]:
+                raise ValueError(capability["reasoning_unavailable_reason"] or f"该模型不支持推理档位 {reasoning_effort}")
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
     selected_provider = selected_route.primary
@@ -2223,6 +2215,7 @@ async def chat(
         "mcp_ids": mcp_ids,
         "invoked_agent_ids": invoked_agent_ids,
         "provider_id": provider_id,
+        "reasoning_effort": reasoning_effort,
         "attachment_images": [str(p) for p in attachment_images],
         "attachment_docs": [str(p) for p in attachment_docs],
         "attachment_ids": attachment_ids,
@@ -2245,6 +2238,8 @@ async def chat(
             provider=selected_provider,
             provider_route=selected_route,
             approval_policy=approval_policy,
+            reasoning_effort=reasoning_effort,
+            user=user,
         ),
     }
     job_id = jobs.enqueue(
@@ -2253,6 +2248,7 @@ async def chat(
         "chat",
         payload,
         idempotency_key=idempotency_key or None,
+        expected_owner_identity=jobs.owner_identity(user),
     )
     canonical = jobs.view(job_id, user.id)
     if canonical is None:  # 防御性分支：入队成功后必须可读
@@ -2315,6 +2311,8 @@ def active_chat_jobs(
             "agent_id": row.agent_id,
             "session_id": str(payload.get("session_id") or ""),
             "project_id": payload.get("project_id"),
+            "provider_id": payload.get("provider_id"),
+            "reasoning_effort": str(payload.get("reasoning_effort") or ""),
             "query": str(payload.get("query") or inputs.get("query") or "正在进行的任务")[:500],
             "source": str(payload.get("source") or "web"),
             "scheduled_task_id": str(payload.get("scheduled_task_id") or ""),
@@ -2658,18 +2656,11 @@ def _user_id_from_request(request: Request) -> Optional[int]:
     流式响应贯穿整个生成过程，不能用 Depends(get_db)/get_current_user 那样持有一条 DB 会话不放
     （DB 在网络共享上时尤其浪费连接）；这里只在建立流时短暂查询后立即关闭。
     """
-    auth = request.headers.get("authorization") or ""
-    token = (
-        auth.split(" ", 1)[1].strip()
-        if auth.lower().startswith("bearer ")
-        else request.cookies.get(settings.AUTH_COOKIE_NAME, "")
-    )
-    if not token:
-        return None
+    from ..security import resolve_request_user
     db = SessionLocal()
     try:
-        user = resolve_access_token(token, db)
-        return user.id
+        user = resolve_request_user(request, db)
+        return user.id if user is not None else None
     except HTTPException:
         return None
     finally:
@@ -2999,13 +2990,9 @@ async def stream_chat_job(job_id: str, request: Request):
                     if not _accept_live_event(ev):
                         continue
                     event_type = ev.get("event_type", "runtime.event")
-                    payload = ev.get("payload") or {}
-                    if event_type in {
-                        "loop.stopped",
-                        "plan.closeout.started",
-                        "plan.closeout.completed",
-                    }:
-                        payload = _public_process_payload(event_type, payload)
+                    if not is_public_process_event(event_type):
+                        continue
+                    payload = _public_process_payload(event_type, ev.get("payload"))
                     yield _event_line(job_id, event_type, {
                         "type": "runtime",
                         "event_type": event_type,
@@ -3087,6 +3074,8 @@ def download_export(
 
 @router.get("/knowledge/chat-datasets")
 def chat_knowledge_datasets(user: User = Depends(get_current_user)):
+    if is_guest(user):
+        return []
     """对话页 @ 知识库可选列表：返回当前用户可见（自建 / 已开放）的知识库及其文档。
 
     普通用户仅能看到「已开放」的知识库；管理员另可见自建库。供前端 @ 选择后对库内文件问答。
@@ -3104,6 +3093,8 @@ def chat_command_catalog(
     db: Session = Depends(get_db),
 ):
     """输入框 @ 与 / 命令的统一目录，不返回 Skill 正文、MCP URL 或鉴权信息。"""
+    if is_guest(user):
+        return {"mentions": [], "commands": []}
     agent = resolve_agent(db, agent_id, user)
     bound_skills = _bound_capability_ids(agent, "skill_ids")
     bound_mcp = _bound_capability_ids(agent, "mcp_ids")
@@ -3296,7 +3287,12 @@ def ensure_default_project(
     db: Session = Depends(get_db),
 ):
     """首次使用时创建默认项目；已有项目则只选定一个，不复制容器。"""
-    _lock_project_owner(db, user.id)
+    dialect = db.bind.dialect.name if db.bind is not None else ""
+    owner_locked = False
+    if dialect != "sqlite":
+        # 在支持行锁的数据库上保留原有的所有者级串行语义。
+        _lock_project_owner(db, user.id)
+        owner_locked = True
     row = (
         db.query(Project)
         .filter(
@@ -3307,6 +3303,23 @@ def ensure_default_project(
         .order_by(Project.id)
         .first()
     )
+    if row is None and not owner_locked:
+        # 页面加载会重复调用该幂等接口；已有可用默认项目时不能占用 SQLite
+        # 唯一写锁。确需创建/切换时，先结束预查读事务，再取得所有者锁并
+        # 二次检查，避免并发启动请求创建两个默认项目。
+        db.rollback()
+        _lock_project_owner(db, user.id)
+        owner_locked = True
+        row = (
+            db.query(Project)
+            .filter(
+                Project.user_id == user.id,
+                Project.is_default.is_(True),
+                Project.is_archived.is_(False),
+            )
+            .order_by(Project.id)
+            .first()
+        )
     if row is None:
         row = (
             db.query(Project)
@@ -3331,6 +3344,8 @@ def ensure_default_project(
                 .order_by(Agent.id)
                 .first()
             )
+            if is_guest(user):
+                default_agent = guest_agent(db, user)
             row = Project(
                 user_id=user.id,
                 name=name,
@@ -3343,6 +3358,11 @@ def ensure_default_project(
             db.add(row)
             db.flush()
         _set_default_project(db, user.id, row)
+        _commit_project_change(db)
+        db.refresh(row)
+    elif owner_locked and dialect == "sqlite":
+        # 另一个启动请求可能已在本请求取得 SQLite 所有者锁前创建记录；
+        # 审计中间件另开写事务前，必须提交用于加锁的 no-op 更新。
         _commit_project_change(db)
         db.refresh(row)
     return _project_public(row, db, user.id)
@@ -3600,6 +3620,9 @@ def thread_memory_status(
             ),
             agent_id=agent.id if policies.memory_scope == "agent" else None,
         )
+        history.extend(memory.load_explicit_history(
+            db, user.id, session_id=thread.id, agent_id=agent.id,
+        ))
         selected = memory.select_recall(
             history,
             latest_query,

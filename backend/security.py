@@ -1,4 +1,4 @@
-"""认证与权限：PBKDF2 口令散列、JWT 签发校验、角色依赖项、API Key 校验。
+"""认证与权限：PBKDF2、服务端浏览器会话、兼容 JWT、角色与 API Key 校验。
 
 权限模型：
 - root  : 全部权限（用户管理、智能体/流程/模型/MCP/Skills/API密钥/知识库、对话）
@@ -6,28 +6,32 @@
 - user  : 默认仅对话；root 可额外授予通用设置模块
 """
 import base64
+import datetime
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import time
 import uuid
 from typing import Optional
 
 import jwt
-from fastapi import Depends, Header, HTTPException, Request, status
+from fastapi import Depends, Header, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from .config import settings
 from .database import get_db
 from .models import (
-    ADMIN_MODULE_KEYS, USER_MODULE_KEYS, ApiKey, ROLE_ADMIN, ROLE_ROOT, ROLE_USER, User,
+    ADMIN_MODULE_KEYS, USER_MODULE_KEYS, ApiKey, AuthSession,
+    ROLE_ADMIN, ROLE_GUEST, ROLE_ROOT, ROLE_USER, User,
 )
 from .rate_limit import client_ip, enforce, reset
 
 _PBKDF2_ITERATIONS = 240_000
 _bearer = HTTPBearer(auto_error=False)
+_SESSION_TOKEN_PATTERN = re.compile(r"sess_[A-Za-z0-9_-]{43}\Z")
 
 
 # ---------- 口令散列（stdlib，免编译依赖） ----------
@@ -85,11 +89,88 @@ def resolve_access_token(token: str, db: Session) -> User:
         user = db.get(User, int(payload["sub"]))
     except (jwt.PyJWTError, TypeError, ValueError):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "登录已失效，请重新登录")
-    if user is None or not user.is_active:
+    if user is None or not user.is_active or user.role == ROLE_GUEST:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "账号不存在或已禁用")
     if int(payload.get("ver", -1)) != int(user.token_version or 0):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "登录已撤销，请重新登录")
     return user
+
+
+def _session_digest(token: str) -> str | None:
+    if not isinstance(token, str) or not _SESSION_TOKEN_PATTERN.fullmatch(token):
+        return None
+    return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+
+def revoke_browser_session(db: Session, token: str) -> None:
+    """Revoke exactly the supplied browser credential; caller commits."""
+    digest = _session_digest(token)
+    if digest is not None:
+        db.query(AuthSession).filter(AuthSession.token_hash == digest).delete(synchronize_session=False)
+
+
+def create_browser_session(db: Session, user: User, previous_token: str = "") -> str:
+    """Issue a fresh credential and rotate any previous cookie in this transaction."""
+    db.flush()
+    if user.id is None or not user.is_active or user.role == ROLE_GUEST:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "账号不存在或已禁用")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    revoke_browser_session(db, previous_token)
+    db.query(AuthSession).filter(
+        AuthSession.user_id == user.id, AuthSession.expires_at <= now,
+    ).delete(synchronize_session=False)
+    token = "sess_" + secrets.token_urlsafe(32)
+    db.add(AuthSession(
+        token_hash=_session_digest(token), user_id=user.id,
+        token_version=int(user.token_version or 0), created_at=now,
+        expires_at=now + datetime.timedelta(minutes=max(1, settings.AUTH_SESSION_EXPIRE_MINUTES)),
+    ))
+    db.flush()
+    return token
+
+
+def set_browser_session_cookie(response: Response, request: Request, token: str) -> None:
+    # No max_age/expires: the browser stores a session cookie, not a persistent
+    # credential. The server independently enforces expires_at and revocation.
+    response.set_cookie(
+        settings.AUTH_COOKIE_NAME, token, httponly=True,
+        secure=settings.AUTH_COOKIE_SECURE or request.url.scheme == "https",
+        samesite="strict", path="/",
+    )
+
+
+def resolve_session_token(token: str, db: Session) -> User:
+    """Resolve only an opaque browser cookie; JWTs are never accepted here."""
+    digest = _session_digest(token)
+    if digest is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "登录已失效，请重新登录")
+    session = db.get(AuthSession, digest, populate_existing=True)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    expires = session.expires_at if session is not None else None
+    if expires is not None and expires.tzinfo is None:
+        expires = expires.replace(tzinfo=datetime.timezone.utc)
+    if session is None or expires is None or expires <= now:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "登录已失效，请重新登录")
+    user = db.get(User, session.user_id, populate_existing=True)
+    if user is None or not user.is_active or user.role == ROLE_GUEST:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "账号不存在或已禁用")
+    if session.token_version != int(user.token_version or 0):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "登录已撤销，请重新登录")
+    return user
+
+
+resolve_session = resolve_session_token
+
+
+def resolve_request_user(request: Request, db: Session) -> User:
+    """Keep browser cookies and non-browser Bearer JWTs as separate transports."""
+    auth = request.headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        return resolve_access_token(auth.split(" ", 1)[1].strip(), db)
+    token = request.cookies.get(settings.AUTH_COOKIE_NAME, "")
+    if not token:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "未登录")
+    return resolve_session_token(token, db)
 
 
 def get_current_user(
@@ -97,13 +178,10 @@ def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(_bearer),
     db: Session = Depends(get_db),
 ) -> User:
-    token = (
-        credentials.credentials if credentials is not None
-        else request.cookies.get(settings.AUTH_COOKIE_NAME, "")
-    )
-    if not token:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "未登录")
-    return resolve_access_token(token, db)
+    user = (resolve_access_token(credentials.credentials, db) if credentials is not None
+            else resolve_request_user(request, db))
+    request.state.audit_identity = (user.id, user.username, user.role)
+    return user
 
 
 def require_admin(user: User = Depends(get_current_user)) -> User:
@@ -120,6 +198,8 @@ def user_modules(user: User) -> Optional[set]:
     """
     if user.role == ROLE_ROOT:
         return None
+    if user.role == ROLE_GUEST:
+        return set()
     raw = (getattr(user, "permissions", "") or "").strip()
     if raw == "":
         return None if user.role == ROLE_ADMIN else set()
@@ -210,6 +290,8 @@ def can_access_agent(user: User, agent) -> bool:
     但仍可按递增 ID 直接调用。
     """
     if user is None or agent is None or not bool(getattr(agent, "enabled", False)):
+        return False
+    if user.role == ROLE_GUEST:
         return False
     return bool(
         is_root(user)

@@ -3,6 +3,8 @@
 data/
 output/
 tmp/
+build/
+dist/
 data_harness_test/
 
 # Python environments and caches
@@ -24,3 +26,11 @@ browser_profiles/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local reference checkout and private acceptance evidence
+deepseek-harness/
+design-qa.md
+docs/*2026*/
+docs/*2026*.md
+docs/explicit-mcp-routing-fix.md
+docs/conversational-design-system.md

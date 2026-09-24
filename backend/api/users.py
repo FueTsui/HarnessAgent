@@ -4,12 +4,14 @@ root 可管理所有用户的角色，并为 admin / user 授予可访问的设�
 """
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..database import get_db
+from ..service_models import CustomService, ServiceRun
+from ..guardrail_models import GuardrailPolicy, GuardrailBlocklist
 from ..artifacts import delete_for_owner, purge_unreferenced_files
 from ..models import (
     ADMIN_MODULE_KEYS,
@@ -39,13 +41,28 @@ from ..models import (
     UserTokenLimit,
 )
 from ..schemas import UserCreate, UserOut, UserUpdate
-from ..security import hash_password, require_root
+from ..security import get_current_user, hash_password, require_root
+from ..user_preferences import PreferenceUpdate, read_preferences, save_preferences
+from ..guest_cleanup import cleanup_guest_users
 
 router = APIRouter(prefix="/api/v1/users", tags=["用户管理（root）"])
 
 
+@router.get("/me/preferences")
+def get_my_preferences(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return read_preferences(user, db)
+
+
+@router.patch("/me/preferences")
+def update_my_preferences(body: PreferenceUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return save_preferences(user, db, body)
+
+
 def user_out(u: User) -> UserOut:
     """构造 UserOut；admin 空授权代表全部，user 空授权代表无模块。"""
+    if u.role == "guest":
+        return UserOut(id=u.id, username=u.username, role=u.role, is_active=u.is_active,
+                       is_guest=True, all_modules=False, modules=[])
     raw = (getattr(u, "permissions", "") or "").strip()
     if u.role == ROLE_ROOT or (u.role == ROLE_ADMIN and raw == ""):
         return UserOut(id=u.id, username=u.username, role=u.role, is_active=u.is_active,
@@ -92,7 +109,7 @@ def list_modules(_: User = Depends(require_root)):
 
 @router.get("", response_model=list[UserOut])
 def list_users(_: User = Depends(require_root), db: Session = Depends(get_db)):
-    return [user_out(u) for u in db.query(User).order_by(User.id).all()]
+    return [user_out(u) for u in db.query(User).filter(User.role != "guest").order_by(User.id).all()]
 
 
 @router.post("", response_model=UserOut, status_code=status.HTTP_201_CREATED)
@@ -110,6 +127,11 @@ def create_user(body: UserCreate, _: User = Depends(require_root), db: Session =
     db.commit()
     db.refresh(user)
     return user_out(user)
+
+
+@router.delete("/guests")
+def delete_guests(current: User = Depends(require_root), db: Session = Depends(get_db)):
+    return cleanup_guest_users(db, current)
 
 
 @router.patch("/{user_id}", response_model=UserOut)
@@ -150,19 +172,25 @@ def update_user(
     return user_out(user)
 
 
-@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{user_id}")
 def delete_user(user_id: int, current: User = Depends(require_root), db: Session = Depends(get_db)):
     if user_id == current.id:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "不能删除自己的账号")
     user = db.get(User, user_id)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "用户不存在")
+    if user.role == "guest":
+        return cleanup_guest_users(db, current, [user_id])
     dependencies = [
         ("模型提供商", db.query(ModelProvider).filter(ModelProvider.created_by == user_id).count()),
         ("智能体", db.query(Agent).filter(Agent.created_by == user_id).count()),
         ("Harness 版本", db.query(HarnessVersion).filter(HarnessVersion.created_by == user_id).count()),
         ("改进提案", db.query(ImprovementProposal).filter(ImprovementProposal.created_by == user_id).count()),
         ("MCP", db.query(McpServer).filter(McpServer.created_by == user_id).count()),
+        ("自定义服务", db.query(CustomService).filter(CustomService.created_by == user_id).count()),
+        ("服务运行记录", db.query(ServiceRun).filter(ServiceRun.owner_id == user_id).count()),
+        ("护栏策略", db.query(GuardrailPolicy).filter(GuardrailPolicy.created_by == user_id).count()),
+        ("护栏阻止列表", db.query(GuardrailBlocklist).filter(GuardrailBlocklist.created_by == user_id).count()),
         ("技能", db.query(Skill).filter(Skill.created_by == user_id).count()),
         ("模板", db.query(Template).filter(Template.created_by == user_id).count()),
         ("API Key", db.query(ApiKey).filter(ApiKey.created_by == user_id).count()),
@@ -207,6 +235,9 @@ def delete_user(user_id: int, current: User = Depends(require_root), db: Session
                 text("DELETE FROM conversations WHERE user_id = :user_id"),
                 {"user_id": user_id},
             )
+    # memory_entries are exclusively account-owned and have ON DELETE CASCADE;
+    # deleting an account removes its explicit memories rather than transferring
+    # or promoting them to another user's global scope.
     db.delete(user)
     try:
         db.commit()
@@ -217,3 +248,4 @@ def delete_user(user_id: int, current: User = Depends(require_root), db: Session
             "该用户仍有关联数据，请先转移或删除后重试",
         ) from exc
     purge_unreferenced_files(db, artifact_filenames)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

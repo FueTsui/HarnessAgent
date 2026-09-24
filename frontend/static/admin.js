@@ -1,12 +1,10 @@
-Auth.requireLogin();
-if (!Auth.canAccessSettings()) location.href = "/";
-initTopbar();
 
 const $ = id => document.getElementById(id);
 const state = {
   agents: [], providers: [], skills: [], mcp: [], editingAgent: null,
   capabilities: [],
   activeResource: null, editingResource: null, resourceRows: [],
+  guestCleanupPending: false,
   resourceMode: "edit", providerPresets: {}, userModules: [],
   auditPage: 0, auditPageSize: 10, auditTotal: 0,
   tokenDays: 30, tokenUserId: "", tokenLimitUserId: null,
@@ -14,6 +12,10 @@ const state = {
   weixinChannelId: null, weixinPollTimer: null,
   providerGovernance: new Map(), providerPriceId: null,
   operationsHours: 24,
+  currentTab: null, resourceRequest: 0, agentRequest: 0,
+  agentQuery: "", agentFilter: "all", resourceQuery: "", resourceFilter: "all",
+  selectedAgents: new Set(),
+  categoryPages: {},
 };
 
 const resources = {
@@ -36,7 +38,7 @@ const resources = {
     ],
   },
   mcp: {
-    title: "MCP", copy: "通过连接向导配置 MCP 服务；请求头按键值对管理，密钥不会出现在卡片中。",
+    title: "MCP", copy: "连接远程服务或通过 stdio 启动本地 MCP 进程，检测连接并复核工具目录。",
     endpoint: "/api/v1/mcp-servers",
     createLabel: "连接 MCP", importLabel: "导入 JSON", exportLabel: "导出配置",
     importAccept: ".json,application/json", importEndpoint: "/api/v1/mcp-servers/import",
@@ -44,16 +46,20 @@ const resources = {
     fields: [
       {name: "name", label: "连接名称", required: true, placeholder: "例如：Tavily 搜索"},
       {name: "description", label: "用途说明", type: "textarea", placeholder: "说明智能体应在什么情况下使用它"},
-      {name: "transport", label: "传输协议", type: "select", options: [["http", "HTTP"], ["sse", "SSE"]], value: "http"},
+      {name: "transport", label: "传输协议", type: "select", options: () => [["http", "Streamable HTTP"], ["sse", "SSE"], ...(Auth.role() === "root" ? [["stdio", "Stdio · 本地进程"]] : [])], value: "http"},
       {name: "url", label: "服务地址", type: "url", required: true, placeholder: "https://example.com/mcp"},
       {name: "headers", label: "鉴权请求头", type: "keyvalue", help: "例如 Authorization → Bearer …；留空则不发送附加请求头"},
+      {name: "command", label: "可执行程序", placeholder: "例如 python.exe、node.exe 或 npx", help: "仅 root 可注册本机程序；直接执行，不经过 Shell。Windows 的 npm/npx 会通过已安装的 Node 启动；其他 .cmd/.bat 不受支持。"},
+      {name: "args", label: "启动参数（JSON 数组）", type: "json-array", value: [], placeholder: '["C:/mcp/server.py"]', help: "每项是一个完整参数；含空格的路径无需额外引号。参数按配置原样传入；npx 的 -y 等参数由 root 明确指定。"},
+      {name: "cwd", label: "工作目录", placeholder: "可选，填写服务器上的绝对路径"},
+      {name: "env", label: "环境变量", type: "keyvalue", help: "只继承基础系统环境。值可引用 ${ENV_VAR}；保存后统一脱敏。保留 ******** 即保留原值，删除行后保存会删除该变量。"},
       {name: "risk_policy", label: "工具风险策略", type: "select", options: [["auto", "自动识别（推荐）"], ["read_only", "已审核为只读服务"]], value: "auto", help: "只读策略仍会拦截带写入动词或服务端写操作注解的工具。"},
       {name: "enabled", label: "启用此连接", type: "checkbox", value: true},
       {name: "is_public", label: "允许其他获授权用户使用", type: "checkbox", editOnly: true},
     ],
   },
   skills: {
-    title: "Skills", copy: "用说明、执行指令和配套资源创建能力包，也可直接导入 SKILL.md 或 ZIP 包。",
+    title: "技能", copy: "用触发说明、执行指令和配套资源封装可复用技能，支持导入 SKILL.md 或 ZIP 包。",
     endpoint: "/api/v1/skills",
     createLabel: "新建 Skill", importLabel: "导入技能包", exportLabel: "导出全部",
     importAccept: ".json,.zip,.md,application/json,application/zip,text/markdown", importEndpoint: "/api/v1/skills/import",
@@ -95,20 +101,19 @@ const resources = {
     ],
   },
   capabilities: {
-    title: "内置能力",
+    title: "内置工具",
     copy: "仅 root 可调整全局开关。停用后所有智能体立即失去该工具；分配关系会保留，重新启用即可恢复。",
     endpoint: "/api/v1/capabilities/manage",
     readOnlyCreate: true,
   },
   providers: {
-    title: "模型提供商", copy: "按协议配置任意 OpenAI 或 Anthropic 兼容网关，可在保存前识别当前凭据可用的模型。",
+    title: "模型", copy: "管理模型连接，查看调用健康、响应延迟与价格，配置可供智能体使用的模型。",
     endpoint: "/api/v1/providers",
     createLabel: "添加模型", importLabel: "导入 Codex 登录", exportLabel: "导出安全配置",
     exportType: "safe-providers",
     fields: [
       {name: "connection", label: "连接与协议", type: "section", copy: "选择兼容协议和实际调用线路；Azure、代理网关和私有部署均使用相同配置方式。"},
       {name: "provider_type", label: "兼容协议", type: "select", options: [["openai", "OpenAI 兼容"], ["anthropic", "Anthropic 兼容"], ["chatgpt", "ChatGPT 订阅（Codex 登录）"]], value: "openai"},
-      {name: "name", label: "显示名称", required: true},
       {name: "base_url", label: "API 基础地址", type: "url", required: true, placeholder: "https://api.example.com/v1"},
       {name: "api_key", label: "API Key", type: "password", createOnly: false, help: "编辑时留空表示保留现有凭据"},
       {name: "wire_api", label: "调用线路", type: "select", options: [["responses", "Responses API"], ["chat_completions", "Chat Completions"], ["messages", "Anthropic Messages"]], value: "responses"},
@@ -116,14 +121,14 @@ const resources = {
       {name: "auth_header", label: "认证请求头名称", placeholder: "例如 X-API-Key"},
       {name: "models", label: "通用模型", type: "section", copy: "参考 OpenClaw 模型元数据：选择一个模型 ID，并显式声明它的名称、输入模态、推理能力和窗口限制。"},
       {name: "model_id", label: "模型 ID", required: true, detectModels: true, placeholder: "先识别模型或手动输入模型 ID"},
-      {name: "model_name", label: "模型显示名称", placeholder: "可选，例如 GPT 5.6"},
+      {name: "model_name", label: "模型名称", required: true, placeholder: "例如 GPT-6 Astra", help: "显示在对话和模型选择中；实际调用使用模型 ID。"},
       {name: "model_input", label: "输入模态", type: "model-input", value: ["text"], help: "文本为必选；只有确认模型原生接收图片时才开启图片。"},
-      {name: "model_reasoning", label: "支持推理", type: "checkbox", help: "声明模型能够接收推理强度配置；它不是通过模型名称猜测的。"},
+      {name: "model_reasoning", label: "支持推理", type: "checkbox", help: "声明模型具有推理能力；在下方确认档位与请求方式。"},
+      {name: "reasoning_config", label: "推理设置", type: "reasoning-config"},
       {name: "generation", label: "模型限制与生成参数", type: "section"},
       {name: "context_window", label: "上下文窗口", type: "number", min: 0, value: 0, help: "0 表示使用系统默认上下文预算。"},
       {name: "max_tokens", label: "最大输出 Tokens", type: "number", min: 1, value: 8192},
       {name: "max_tokens_param", label: "输出长度参数名", type: "select", options: [["auto", "按协议自动"], ["max_tokens", "max_tokens"], ["max_completion_tokens", "max_completion_tokens"], ["max_output_tokens", "max_output_tokens"], ["none", "不发送"]], value: "auto"},
-      {name: "reasoning_effort", label: "推理强度", type: "select", options: [["", "服务默认"], ["minimal", "Minimal"], ["low", "Low"], ["medium", "Medium"], ["high", "High"], ["xhigh", "XHigh"], ["max", "Max"]], value: ""},
       {name: "supports_temperature", label: "发送 Temperature 参数", type: "checkbox", value: true, help: "若模型不接受 temperature，请关闭。"},
       {name: "reliability", label: "超时与重试", type: "section"},
       {name: "timeout_ms", label: "请求超时（毫秒）", type: "number", min: 1000, value: 120000},
@@ -193,15 +198,33 @@ function json(value, fallback = {}) {
   try { return JSON.parse(value || ""); } catch (_) { return fallback; }
 }
 
+function providerModelName(item) {
+  const modelName = String(item?.model_name || "").trim();
+  const legacyName = String(item?.name || "").trim();
+  return modelName || (!legacyName.startsWith("__personal_model_") ? legacyName : "") || item?.model_id || "";
+}
+
 function providerName(id) {
-  return state.providers.find(item => item.id === id)?.name || (id ? `#${id}` : "默认模型");
+  return providerModelName(state.providers.find(item => item.id === id)) || (id ? `#${id}` : "默认模型");
 }
 
 function choiceHtml(items, selected, name, currentId) {
-  return items.filter(item => item.id !== currentId).map(item => `
+  const available = items.filter(item => item.id !== currentId);
+  const preserved = (selected || []).filter(id => !available.some(item => item.id === id));
+  return (available.map(item => `
     <label class="choice"><input type="checkbox" name="${name}" value="${item.id}"
       ${(selected || []).includes(item.id) ? "checked" : ""} />${escapeHtml(item.name)}</label>`).join("")
-    || '<span class="hint">暂无可选项</span>';
+    || '<span class="hint">暂无可选项</span>') + (preserved.length
+      ? `<span class="hint">${preserved.length} 项现有绑定当前不可编辑，保存时保留。</span>` : "");
+}
+
+function agentBindingUpdate(previous, available, selected) {
+  const editable = new Set(available);
+  const next = [...new Set([...(previous || []).filter(value => !editable.has(value)), ...selected])];
+  // Omit untouched PATCH fields. Missing catalogs or withdrawn module access
+  // must never turn an unrelated model/name edit into a capabilities removal.
+  if (previous && previous.length === next.length && previous.every(value => next.includes(value))) return undefined;
+  return next;
 }
 
 function checked(name) {
@@ -219,7 +242,7 @@ async function loadCatalogs() {
       ? api("/api/v1/agents/enabled")
       : Promise.resolve([]);
   const results = await Promise.allSettled([
-    Auth.canModule("providers") ? api("/api/v1/providers") : Promise.resolve([]),
+    Auth.canModule("providers") ? api("/api/v1/providers") : Auth.canModule("agents") ? api("/api/v1/agents/model-options") : Promise.resolve([]),
     Auth.canModule("skills") ? api("/api/v1/skills") : Promise.resolve([]),
     Auth.canModule("mcp") ? api("/api/v1/mcp-servers") : Promise.resolve([]),
     Auth.canModule("providers") ? api("/api/v1/providers/presets") : Promise.resolve({}),
@@ -256,22 +279,45 @@ async function ensureResourceDependencies(key) {
 }
 
 async function loadAgents() {
-  state.agents = await api("/api/v1/agents");
-  $("agents-grid").innerHTML = state.agents.map(agent => `
+  const request = ++state.agentRequest;
+  const agents = await api("/api/v1/agents");
+  if (request !== state.agentRequest) return;
+  state.agents = agents;
+  state.selectedAgents = new Set([...state.selectedAgents].filter(id => agents.some(item => item.id === id)));
+  renderAgents();
+}
+
+function matchesCollection(item, query, filter, key = "") {
+  const text = [item.name, item.username, item.description, item.model_id, item.model_name,
+    item.group, item.kind, item.transport, item.query, ...(item.files || [])].join(" ").toLocaleLowerCase();
+  if (query && !text.includes(query.trim().toLocaleLowerCase())) return false;
+  if (filter === "public") return !!item.is_public;
+  const enabled = key === "knowledge" ? item.is_public : (item.enabled ?? item.is_active ?? true);
+  return filter === "all" || (filter === "enabled" ? !!enabled : !enabled);
+}
+
+function collectionEmpty(query, noun) {
+  return `<div class="empty-state collection-empty">${icon(query ? "search" : "package", 28)}<strong>${query ? "没有匹配结果" : `还没有${noun}`}</strong><span>${query ? "尝试其他关键词，或重置筛选条件。" : "使用右上方的操作添加第一项，配置保存后会显示在这里。"}</span></div>`;
+}
+
+function renderAgents() {
+  const rows = state.agents.filter(agent => matchesCollection(agent, state.agentQuery, state.agentFilter));
+  if ($("agents-count")) $("agents-count").textContent = `${rows.length} / ${state.agents.length} 个智能体`;
+  $("agents-grid").innerHTML = rows.map(agent => `
     <article class="card agent-card ${agent.enabled ? "" : "disabled"}">
       <div class="card-title-row">
-        <label class="select-check" title="选择用于导出"><input type="checkbox" data-agent-select="${agent.id}" /></label>
+        <label class="select-check" title="选择用于导出"><input type="checkbox" aria-label="选择 ${escapeHtml(agent.name)} 用于导出" data-agent-select="${agent.id}" ${state.selectedAgents.has(agent.id) ? "checked" : ""} /></label>
         <div class="agent-icon">${icon("sparkles", 17)}</div>
-        <div><h3>${escapeHtml(agent.name)}</h3><span>Harness v${agent.active_version}</span></div>
+        <div><h3>${escapeHtml(agent.name)}</h3><span>版本 ${agent.active_version} · ${agent.enabled ? "已启用" : "已停用"}</span></div>
         ${agent.is_default ? '<b class="tag">默认</b>' : ""}
       </div>
       <p>${escapeHtml(agent.description || "未填写用途说明")}</p>
       <div class="meta-row">
         <span>${escapeHtml(providerName(agent.provider_id))}</span>
-        <span>Skills ${agent.skill_ids.length}</span>
+        <span>技能 ${(agent.skill_ids || []).length}</span>
         <span>内置 ${(agent.builtin_tools || []).filter(name =>
           state.capabilities.some(item => item.name === name && item.enabled)).length}/${(agent.builtin_tools || []).length}</span>
-        <span>MCP ${agent.mcp_ids.length}</span>
+        <span>服务 ${(agent.mcp_ids || []).length}</span>
         <span>${agent.memory_enabled ? "记忆开启" : "无长期记忆"}</span>
       </div>
       <div class="card-actions">
@@ -280,12 +326,19 @@ async function loadAgents() {
         ${Auth.role() === "root" && !agent.is_default ? `<button class="btn small ghost" data-default="${agent.id}">设为默认</button>` : ""}
         ${agent.can_manage ? `<button class="btn small danger" data-delete="${agent.id}">删除</button>` : ""}
       </div>
-    </article>`).join("") || '<div class="empty-state">暂无智能体</div>';
+    </article>`).join("") || collectionEmpty(state.agentQuery || state.agentFilter !== "all", "智能体");
+  $("agents-grid").querySelectorAll("[data-agent-select]").forEach(input => input.onchange = () => {
+    if (input.checked) state.selectedAgents.add(Number(input.dataset.agentSelect));
+    else state.selectedAgents.delete(Number(input.dataset.agentSelect));
+  });
   $("agents-grid").querySelectorAll("[data-edit]").forEach(b => b.onclick = () => openAgent(Number(b.dataset.edit)));
   $("agents-grid").querySelectorAll("[data-versions]").forEach(b => b.onclick = () => openVersions(Number(b.dataset.versions)));
   $("agents-grid").querySelectorAll("[data-default]").forEach(b => b.onclick = async () => {
-    await api(`/api/v1/agents/${b.dataset.default}`, {method: "PATCH", json: {is_default: true}});
-    loadAgents();
+    b.disabled = true;
+    try {
+      await api(`/api/v1/agents/${b.dataset.default}`, {method: "PATCH", json: {is_default: true}});
+      await loadAgents();
+    } catch (error) { showToast(error.message); b.disabled = false; }
   });
   $("agents-grid").querySelectorAll("[data-delete]").forEach(b => b.onclick = async () => {
     if (!confirm("删除智能体及其全部 Harness 版本？")) return;
@@ -302,21 +355,9 @@ function openAgent(id = null) {
   $("agent-description").value = agent?.description || "";
   $("agent-opening").value = agent?.opening_statement || "";
   $("agent-prompt").value = agent?.system_prompt || "";
-  $("agent-provider").innerHTML = '<option value="">默认模型</option>' + state.providers.map(item =>
-    `<option value="${item.id}" ${agent?.provider_id === item.id ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("");
-  const routing = agent?.routing?.mode === "policy" ? agent.routing : {};
-  const fallbackIds = new Set(routing.fallback_provider_ids || []);
-  $("agent-route-strategy").value = routing.strategy || (fallbackIds.size ? "ordered" : "fixed");
-  $("agent-provider-fallbacks").innerHTML = state.providers.map(item => `
-    <label class="choice"><input type="checkbox" name="agent_provider_fallback" value="${item.id}"
-      ${fallbackIds.has(item.id) ? "checked" : ""} />${escapeHtml(item.name)}</label>`).join("") || '<span class="hint">暂无备用 Provider</span>';
-  const health = routing.health || {};
-  $("agent-health-lookback").value = health.lookback_minutes || 60;
-  $("agent-health-min-samples").value = health.min_samples || 3;
-  $("agent-health-error-rate").value = health.max_error_rate ?? 0.6;
-  $("agent-health-consecutive").value = health.consecutive_failures || 3;
-  $("agent-skills").innerHTML = choiceHtml(state.skills, agent?.skill_ids, "agent_skill", id);
-  $("agent-mcp").innerHTML = choiceHtml(state.mcp, agent?.mcp_ids, "agent_mcp", id);
+  AgentModelConfig.load(agent, state.providers);
+  $("agent-skills").innerHTML = choiceHtml(state.skills, agent?.skill_ids, "agent_skill");
+  $("agent-mcp").innerHTML = choiceHtml(state.mcp, agent?.mcp_ids, "agent_mcp");
   $("agent-children").innerHTML = choiceHtml(state.agents, agent?.agent_ids, "agent_child", id);
   if (Auth.role() === "root") {
     $("agent-builtins").innerHTML = state.capabilities.map(item => {
@@ -340,12 +381,21 @@ function openAgent(id = null) {
   $("agent-enabled").checked = agent ? !!agent.enabled : true;
   $("agent-error").textContent = "";
   $("agent-dialog").showModal();
+  $("agent-dialog").querySelector(".agent-editor-content").scrollTop = 0;
 }
 
 async function saveAgent() {
-  const routeStrategy = $("agent-route-strategy").value;
   const mainProviderId = $("agent-provider").value ? Number($("agent-provider").value) : null;
-  const fallbackIds = checked("agent_provider_fallback").filter(id => id !== mainProviderId);
+  $("agent-error").textContent = "";
+  if (!$("agent-name").value.trim()) {
+    $("agent-error").textContent = "名称必填";
+    AgentModelConfig.selectTab("overview");
+    $("agent-name").focus();
+    return;
+  }
+  let routing;
+  try { routing = AgentModelConfig.read(state.editingAgent?.routing, mainProviderId); }
+  catch (error) { $("agent-error").textContent = error.message; AgentModelConfig.focusError(error); return; }
   const payload = {
     name: $("agent-name").value.trim(),
     description: $("agent-description").value.trim(),
@@ -353,50 +403,36 @@ async function saveAgent() {
     system_prompt: $("agent-prompt").value,
     provider_id: mainProviderId,
     clear_provider: !$("agent-provider").value,
-    skill_ids: checked("agent_skill"),
-    mcp_ids: checked("agent_mcp"),
-    agent_ids: checked("agent_child"),
+    skill_ids: agentBindingUpdate(state.editingAgent?.skill_ids, (state.skills || []).map(item => item.id), checked("agent_skill")),
+    mcp_ids: agentBindingUpdate(state.editingAgent?.mcp_ids, (state.mcp || []).map(item => item.id), checked("agent_mcp")),
+    agent_ids: agentBindingUpdate(state.editingAgent?.agent_ids, (state.agents || []).filter(item => item.id !== state.editingAgent?.id).map(item => item.id), checked("agent_child")),
     memory_enabled: $("agent-memory").checked,
     is_public: $("agent-public").checked,
     enabled: $("agent-enabled").checked,
-    routing: routeStrategy === "fixed" && !fallbackIds.length ? {} : {
-      mode: "policy",
-      default_provider_id: mainProviderId,
-      fallback_provider_ids: fallbackIds,
-      strategy: routeStrategy === "lowest_cost" ? "lowest_cost" : "ordered",
-      health: {
-        enabled: true,
-        lookback_minutes: Number($("agent-health-lookback").value || 60),
-        min_samples: Number($("agent-health-min-samples").value || 3),
-        max_error_rate: Number($("agent-health-error-rate").value || 0.6),
-        consecutive_failures: Number($("agent-health-consecutive").value || 3),
-      },
-      // The compact dialog edits the default route only.  Preserve advanced
-      // modality/rule routing configured through the API instead of erasing it.
-      rules: Array.isArray(state.editingAgent?.routing?.rules)
-        ? state.editingAgent.routing.rules
-        : [],
-    },
+    routing,
   };
   if (Auth.role() === "root") {
-    // 被全局停用但原本已分配的能力仍保留绑定，重新启用后自动恢复。
-    const disabledAssigned = (state.editingAgent?.builtin_tools || []).filter(name =>
-      state.capabilities.some(item => item.name === name && !item.enabled)
-    );
-    payload.builtin_tools = [...new Set([
-      ...checkedStrings("agent_builtin"), ...disabledAssigned,
-    ])];
+    payload.builtin_tools = agentBindingUpdate(state.editingAgent?.builtin_tools,
+      state.capabilities.filter(item => item.enabled).map(item => item.name), checkedStrings("agent_builtin"));
   }
-  if (!payload.name) { $("agent-error").textContent = "名称必填"; return; }
+  const saveButton = $("agent-save");
+  if (saveButton.disabled) return;
+  saveButton.disabled = true;
+  saveButton.textContent = "正在保存…";
   try {
+    let saved;
     if (state.editingAgent) {
-      await api(`/api/v1/agents/${state.editingAgent.id}`, {method: "PATCH", json: payload});
+      saved = await api(`/api/v1/agents/${state.editingAgent.id}`, {method: "PATCH", json: payload});
     } else {
-      await api("/api/v1/agents", {method: "POST", json: payload});
+      saved = await api("/api/v1/agents", {method: "POST", json: payload});
     }
     $("agent-dialog").close();
-    await loadAgents();
+    showToast(saved?.active_version > (state.editingAgent?.active_version || 0)
+      ? `智能体配置已保存，版本 ${saved.active_version} 已发布` : "智能体配置已保存");
+    try { await loadAgents(); }
+    catch (error) { showToast(`配置已保存，但列表刷新失败：${error.message}。请重新进入智能体页面刷新。`); }
   } catch (error) { $("agent-error").textContent = error.message; }
+  finally { saveButton.disabled = false; saveButton.textContent = "保存更改"; }
 }
 
 async function openVersions(agentId) {
@@ -426,21 +462,36 @@ async function loadImprovement() {
   const [runs, proposals] = await Promise.all([
     api("/api/v1/improvement/turns"), api("/api/v1/improvement/proposals"),
   ]);
+  const labels = {completed: "已完成", completed_with_issues: "完成但有待处理项", failed: "失败", cancelled: "已取消", running: "运行中", pending: "排队中", proposed: "待评估", evaluating: "评估中", evaluated: "待批准", approved: "已批准", published: "已发布", rejected: "已驳回"};
+  let overview = $("evaluation-overview");
+  if (!overview) {
+    overview = document.createElement("div");
+    overview.id = "evaluation-overview";
+    overview.className = "module-summary";
+    $("panel-improvement").querySelector(".lab-grid").before(overview);
+  }
+  overview.innerHTML = `<div><span>最近运行</span><strong>${runs.length}</strong></div><div><span>待处理提案</span><strong>${proposals.filter(item => ["proposed", "evaluating", "evaluated"].includes(item.status)).length}</strong></div><p>从运行证据发起改进 → 自动评估 → 人工批准发布。选择运行记录可作为新提案的证据。</p>`;
   $("runs-list").innerHTML = runs.map(run => `
     <div class="stack-item">
       <div><strong>${escapeHtml(run.agent_name || "未知智能体")}</strong><span>${escapeHtml(run.id)} · Harness v${run.harness_version || "?"}</span></div>
-      <b class="status ${run.status}">${run.status}</b>
+      <div class="stack-actions"><b class="status ${escapeHtml(run.status)}">${escapeHtml(labels[run.status] || run.status)}</b><button class="btn small ghost" data-evidence-run="${escapeHtml(run.id)}" data-evidence-agent="${run.agent_id}">据此改进</button></div>
     </div>`).join("") || '<div class="empty-state">暂无运行记录</div>';
   $("proposals-list").innerHTML = proposals.map(item => `
     <div class="stack-item">
       <div><strong>#${item.id} · Agent ${item.agent_id}</strong><span>${escapeHtml(item.hypothesis)}</span></div>
       <div class="stack-actions">
-        <b class="status ${item.status}">${item.status}</b>
+        <b class="status ${escapeHtml(item.status)}">${escapeHtml(labels[item.status] || item.status)}</b>
         ${item.status === "proposed" ? `<button class="btn small ghost" data-eval="${item.id}">启动自动评估</button>` : ""}
         ${item.status === "evaluating" ? `<button class="btn small ghost" data-eval="${item.id}">检查评估结果</button>` : ""}
         ${item.status === "evaluated" ? `<button class="btn small" data-approve="${item.id}">人工批准</button>` : ""}
       </div>
     </div>`).join("") || '<div class="empty-state">暂无改进提案</div>';
+  $("runs-list").querySelectorAll("[data-evidence-run]").forEach(button => button.onclick = () => {
+    openProposal();
+    $("proposal-agent").value = button.dataset.evidenceAgent;
+    $("proposal-evidence").value = button.dataset.evidenceRun;
+    $("proposal-hypothesis").focus();
+  });
   $("proposals-list").querySelectorAll("[data-eval]").forEach(button => button.onclick = async () => {
     await api(`/api/v1/improvement/proposals/${button.dataset.eval}/evaluation`, {
       method: "POST", json: {},
@@ -481,10 +532,14 @@ async function saveProposal() {
 }
 
 function resourceName(item) {
+  if (state.activeResource === "providers") return providerModelName(item) || item.id || "模型";
   return item.name || item.username || item.site_name || item.id || item.key || "记录";
 }
 
 function fieldValue(field, item) {
+  if (state.activeResource === "providers" && field.name === "model_name" && item) {
+    return providerModelName(item);
+  }
   if (item && item[field.name] !== undefined && item[field.name] !== null) return item[field.name];
   return field.value ?? (field.type === "checkbox" ? false : "");
 }
@@ -498,13 +553,14 @@ function fieldOptions(field) {
   return typeof field.options === "function" ? field.options() : (field.options || []);
 }
 
-function renderKeyValueRows(value = {}, typed = false) {
+function renderKeyValueRows(value = {}, typed = false, fieldName = "") {
   const entries = Object.entries(value || {});
   if (!entries.length) entries.push(["", ""]);
+  const environment = fieldName === "env";
   return entries.map(([key, val]) => `
     <div class="repeat-row">
-      <input data-part="key" value="${escapeHtml(key)}" placeholder="${typed ? "参数名称" : "Header 名称"}" />
-      <input data-part="value" value="${escapeHtml(typed && typeof val !== "string" ? JSON.stringify(val) : val)}" placeholder="${typed ? "JSON 值或文本" : "Header 值"}" />
+      <input data-part="key" value="${escapeHtml(key)}" placeholder="${environment ? "环境变量名" : typed ? "参数名称" : "Header 名称"}" aria-label="${environment ? "环境变量名" : "名称"}" />
+      <input data-part="value" ${environment ? 'type="password" autocomplete="new-password"' : 'type="text"'} value="${escapeHtml(typed && typeof val !== "string" ? JSON.stringify(val) : val)}" placeholder="${environment ? "变量值或环境引用" : typed ? "JSON 值或文本" : "Header 值"}" aria-label="${environment ? "环境变量值" : "值"}" />
       <button type="button" class="icon-btn danger" data-remove-row aria-label="删除此行">${icon("close", 15)}</button>
     </div>`).join("");
 }
@@ -525,6 +581,9 @@ function renderField(field, item, editing) {
     return `<div class="form-section" data-section="${field.name}">
       <div><strong>${escapeHtml(field.label)}</strong>${field.copy ? `<small>${escapeHtml(field.copy)}</small>` : ""}</div>
     </div>`;
+  }
+  if (field.type === "reasoning-config") {
+    return '<div class="form-field form-field-wide" data-field-wrap="reasoning_config"><div id="resource-reasoning-config"></div></div>';
   }
   const value = fieldValue(field, item);
   const required = field.required || (field.createRequired && !editing);
@@ -557,8 +616,8 @@ function renderField(field, item, editing) {
   if (field.type === "keyvalue" || field.type === "json-keyvalue") {
     const typed = field.type === "json-keyvalue";
     return `<div class="form-field form-field-wide" data-field-wrap="${field.name}"><label>${escapeHtml(field.label)}</label>
-      <div class="repeat-list" id="resource-field-${field.name}" data-field="${field.name}" data-repeat="${field.type}">${renderKeyValueRows(value, typed)}</div>
-      <button type="button" class="btn small ghost add-row" data-add-row="${field.type}" data-target="${field.name}">${icon("plus", 14)}${typed ? "添加参数" : "添加请求头"}</button>${help}</div>`;
+      <div class="repeat-list" id="resource-field-${field.name}" data-field="${field.name}" data-repeat="${field.type}">${renderKeyValueRows(value, typed, field.name)}</div>
+      <button type="button" class="btn small ghost add-row" data-add-row="${field.type}" data-target="${field.name}">${icon("plus", 14)}${field.name === "env" ? "添加环境变量" : typed ? "添加参数" : "添加请求头"}</button>${help}</div>`;
   }
   if (field.type === "resources") {
     return `<div class="form-field form-field-wide" data-field-wrap="${field.name}"><label>${escapeHtml(field.label)}</label>
@@ -569,9 +628,9 @@ function renderField(field, item, editing) {
     return `<div class="form-field form-field-wide" data-field-wrap="${field.name}"><label for="resource-field-${field.name}">${escapeHtml(field.label)}</label>
       <input id="resource-field-${field.name}" data-field="${field.name}" type="file" ${field.accept ? `accept="${escapeHtml(field.accept)}"` : ""} />${help}</div>`;
   }
-  if (field.type === "textarea") {
+  if (field.type === "textarea" || field.type === "json-array") {
     return `<div class="form-field ${field.large ? "form-field-wide" : ""}" data-field-wrap="${field.name}"><label for="resource-field-${field.name}">${escapeHtml(field.label)}${required ? " *" : ""}</label>
-      <textarea id="resource-field-${field.name}" data-field="${field.name}" class="${field.large ? "code-area" : ""}" placeholder="${escapeHtml(field.placeholder || "")}" ${required ? "required" : ""}>${escapeHtml(value)}</textarea>${help}</div>`;
+      <textarea id="resource-field-${field.name}" data-field="${field.name}" class="${field.large ? "code-area" : ""}" placeholder="${escapeHtml(field.placeholder || "")}" ${required ? "required" : ""}>${escapeHtml(field.type === "json-array" ? JSON.stringify(value || [], null, 2) : value)}</textarea>${help}</div>`;
   }
   return `<div class="form-field" data-field-wrap="${field.name}"><label for="resource-field-${field.name}">${escapeHtml(field.label)}${required ? " *" : ""}</label>
     <div class="${field.detectModels ? "field-action-row" : ""}">
@@ -582,6 +641,25 @@ function renderField(field, item, editing) {
 }
 
 function bindResourceForm(root = $("resource-fields")) {
+  const transport = root.querySelector('[data-field="transport"]');
+  if (state.activeResource === "mcp" && transport) {
+    const updateTransport = () => {
+      const stdio = transport.value === "stdio";
+      for (const name of ["url", "headers", "command", "args", "cwd", "env"]) {
+        const wrap = root.querySelector(`[data-field-wrap="${name}"]`);
+        if (wrap) {
+          wrap.hidden = ["url", "headers"].includes(name) ? stdio : !stdio;
+          wrap.querySelectorAll("input, select, textarea, button").forEach(input => { input.disabled = wrap.hidden; });
+        }
+      }
+      const url = root.querySelector('[data-field="url"]');
+      const command = root.querySelector('[data-field="command"]');
+      if (url) url.required = !stdio;
+      if (command) command.required = stdio;
+    };
+    transport.onchange = updateTransport;
+    updateTransport();
+  }
   root.querySelectorAll("[data-remove-row]").forEach(button => {
     button.onclick = () => {
       const list = button.closest(".repeat-list");
@@ -589,7 +667,7 @@ function bindResourceForm(root = $("resource-fields")) {
       if (!list.children.length) {
         list.innerHTML = list.dataset.repeat === "resources"
           ? renderResourceRows([])
-          : renderKeyValueRows({}, list.dataset.repeat === "json-keyvalue");
+          : renderKeyValueRows({}, list.dataset.repeat === "json-keyvalue", list.dataset.field);
         bindResourceForm(root);
       }
     };
@@ -600,7 +678,7 @@ function bindResourceForm(root = $("resource-fields")) {
       const list = $(`resource-field-${button.dataset.target || "resources"}`);
       list.insertAdjacentHTML("beforeend", type === "resources"
         ? renderResourceRows([])
-        : renderKeyValueRows({}, type === "json-keyvalue"));
+        : renderKeyValueRows({}, type === "json-keyvalue", button.dataset.target));
       bindResourceForm(root);
     };
   });
@@ -613,14 +691,14 @@ function bindResourceForm(root = $("resource-fields")) {
     if (!providerType) return;
     const preset = state.providerPresets[providerType.value] || {};
     if (applyPreset) {
-      for (const name of ["base_url", "wire_api", "auth_type", "api_version", "api_version_mode", "model_id", "model_name"]) {
+      for (const name of ["base_url", "wire_api", "auth_type", "api_version", "api_version_mode", "model_id"]) {
         const input = $(`resource-field-${name}`);
         if (input && preset[name] !== undefined) input.value = preset[name];
       }
       const temperature = $("resource-field-supports_temperature");
       if (temperature) temperature.checked = providerType.value !== "anthropic";
-      const name = $("resource-field-name");
-      if (name && !name.value) name.value = preset.label || providerType.options[providerType.selectedIndex]?.text || "";
+      const modelName = $("resource-field-model_name");
+      if (modelName && !modelName.value.trim()) modelName.value = preset.model_name || preset.model_id || "";
     }
     const allowedWire = providerType.value === "anthropic"
       ? ["messages"]
@@ -633,13 +711,26 @@ function bindResourceForm(root = $("resource-fields")) {
     if (wire && !allowedWire.includes(wire.value)) wire.value = allowedWire[0];
     const customAuth = $("resource-field-auth_type")?.value === "custom";
     document.querySelector("[data-field-wrap='auth_header']")?.toggleAttribute("hidden", !customAuth);
-    const supportsReasoning = $("resource-field-model_reasoning")?.checked;
-    document.querySelector("[data-field-wrap='reasoning_effort']")?.toggleAttribute("hidden", !supportsReasoning);
   };
   providerType?.addEventListener("change", () => updateProviderFields(true));
   $("resource-field-auth_type")?.addEventListener("change", () => updateProviderFields(false));
   $("resource-field-model_reasoning")?.addEventListener("change", () => updateProviderFields(false));
   updateProviderFields(false);
+
+  const reasoningContainer = $("resource-reasoning-config");
+  if (state.activeResource === "providers" && reasoningContainer && state.providerReasoningEditor?.container !== reasoningContainer) {
+    state.providerReasoningEditor?.destroy();
+    state.providerReasoningEditor = ProviderReasoningConfig.mount(reasoningContainer, {
+      initial: state.editingResource || {},
+      getContext: () => ({model_id: $("resource-field-model_id").value, provider_type: $("resource-field-provider_type").value,
+        wire_api: $("resource-field-wire_api").value, model_reasoning: $("resource-field-model_reasoning").checked,
+        max_tokens: Number($("resource-field-max_tokens").value || 8192)}),
+    });
+    for (const name of ["model_id", "provider_type", "wire_api", "model_reasoning", "max_tokens"]) {
+      $(`resource-field-${name}`)?.addEventListener("input", () => state.providerReasoningEditor?.update());
+      $(`resource-field-${name}`)?.addEventListener("change", () => state.providerReasoningEditor?.update());
+    }
+  }
 
   $("provider-detect-models")?.addEventListener("click", async event => {
     const button = event.currentTarget;
@@ -664,9 +755,10 @@ function bindResourceForm(root = $("resource-fields")) {
         <button type="button" class="btn small" id="provider-use-model">选择此模型</button></div>`;
       $("provider-use-model").onclick = () => {
         $("resource-field-model_id").value = $("provider-detected-select").value;
-        if (!$("resource-field-model_name").value) {
+        if (!$("resource-field-model_name").value.trim()) {
           $("resource-field-model_name").value = $("provider-detected-select").value;
         }
+        state.providerReasoningEditor?.update();
       };
     } catch (error) {
       resultBox.innerHTML = `<span class="form-error">${escapeHtml(error.message)}</span>`;
@@ -695,6 +787,8 @@ function bindResourceForm(root = $("resource-fields")) {
 }
 
 function openResourceEditor(item = null) {
+  state.providerReasoningEditor?.destroy();
+  state.providerReasoningEditor = null;
   const config = resources[state.activeResource];
   state.editingResource = item;
   state.resourceMode = "edit";
@@ -742,23 +836,34 @@ function collectResourcePayload({allowIncomplete = false} = {}) {
   for (const field of config.fields || []) {
     if ((field.editOnly && !editing) || (field.createOnly && editing)) continue;
     if (field.type === "section") continue;
+    if (field.type === "reasoning-config") {
+      if (!allowIncomplete) Object.assign(payload, state.providerReasoningEditor.read());
+      continue;
+    }
     if (field.type === "module-choices") {
       payload[field.name] = [...document.querySelectorAll("input[name='resource-modules']:checked")].map(input => input.value);
       continue;
     }
     const input = $(`resource-field-${field.name}`);
     if (!input) continue;
+    if (state.activeResource === "mcp" && input.closest("[data-field-wrap]")?.hidden) continue;
     if (field.type === "checkbox") payload[field.name] = input.checked;
     else if (field.type === "model-input") {
       payload[field.name] = ["text", ...[...input.querySelectorAll("input:checked:not(:disabled)")].map(choice => choice.value)];
     }
+    else if (field.type === "json-array") {
+      try { payload[field.name] = JSON.parse(input.value || "[]"); }
+      catch (_) { throw new Error(`${field.label}必须是有效的 JSON 数组`); }
+      if (!Array.isArray(payload[field.name]) || payload[field.name].some(value => typeof value !== "string")) throw new Error(`${field.label}只允许字符串数组`);
+    }
     else if (field.type === "number") payload[field.name] = Number(input.value || 0);
     else if (field.type === "file") payload[field.name] = input.files?.[0] || null;
     else if (field.type === "keyvalue" || field.type === "json-keyvalue") {
-      payload[field.name] = {};
+      payload[field.name] = Object.create(null);
       input.querySelectorAll(".repeat-row").forEach(row => {
         const key = row.querySelector("[data-part='key']").value.trim();
         if (!key) return;
+        if (state.activeResource === "mcp" && field.name === "env" && Object.prototype.hasOwnProperty.call(payload[field.name], key)) throw new Error(`环境变量 ${key} 重复，请保留一行`);
         const raw = row.querySelector("[data-part='value']").value;
         if (field.type === "json-keyvalue") {
           try { payload[field.name][key] = JSON.parse(raw); }
@@ -775,8 +880,20 @@ function collectResourcePayload({allowIncomplete = false} = {}) {
       if (field.type === "password" && editing && !value) continue;
       payload[field.name] = value;
     }
-    const required = field.required || (field.createRequired && !editing);
+    const required = field.required || (field.createRequired && !editing) || (state.activeResource === "mcp" && input.required);
     if (!allowIncomplete && required && !payload[field.name]) throw new Error(`${field.label}必填`);
+  }
+  if (state.activeResource === "providers") {
+    // The legacy API still requires a connection name; the form has one model name.
+    const internalName = String(state.editingResource?.name || "");
+    payload.name = internalName.startsWith("__personal_model_") ? internalName : payload.model_name;
+  }
+  if (state.activeResource === "mcp" && payload.transport === "stdio") {
+    if (Auth.role() !== "root") throw new Error("stdio 会启动服务器本地程序，仅 root 可创建或修改；你可以使用 root 已共享的服务。");
+    if (payload.args?.length > 100) throw new Error("启动参数最多 100 项");
+    for (const name of Object.keys(payload.env || {})) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(`环境变量名 ${name} 无效`);
+    }
   }
   return payload;
 }
@@ -808,6 +925,9 @@ async function persistSystemSettings(payload) {
 }
 
 async function saveResource() {
+  const button = $("resource-save");
+  if (button.disabled) return;
+  button.disabled = true;
   const config = resources[state.activeResource];
   $("resource-error").textContent = "";
   let resultNotice = null;
@@ -831,6 +951,7 @@ async function saveResource() {
       await api(`/api/v1/templates/${state.editingResource.id}/file`, {method: "POST", body: form});
       showToast("模板源文件已替换");
     } else {
+      if (state.activeResource === "providers") await state.providerReasoningEditor?.refresh();
       const payload = collectResourcePayload();
       const editing = Boolean(state.editingResource) && !config.singleton;
       if (state.activeResource === "knowledge") {
@@ -864,7 +985,10 @@ async function saveResource() {
       await openWeixinLogin(createdResource.id);
     }
   } catch (error) {
-    $("resource-error").textContent = error.message;
+    $("resource-error").textContent = state.activeResource === "providers"
+      ? error.message.replace("提供商名称", "模型名称") : error.message;
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -890,14 +1014,19 @@ function cardActions(actions) {
   return visible.length ? `<div class="card-actions">${visible.join("")}</div>` : "";
 }
 
+function isGuestUser(item) {
+  return item?.role === "guest";
+}
+
 function resourceCard(item, key) {
-  const manageable = item.can_manage !== false;
-  const edit = manageable ? `<button class="btn small ghost" data-resource-action="edit" data-id="${escapeHtml(item.id ?? item.key ?? "")}">编辑</button>` : "";
-  const remove = manageable ? `<button class="btn small danger" data-resource-action="delete" data-id="${escapeHtml(item.id ?? item.key ?? "")}">删除</button>` : "";
-  if (key === "capabilities") return `<article class="card resource-card ${item.enabled ? "" : "disabled"}">
-    <div class="card-title-row"><div><h3>${escapeHtml(item.name)}</h3><span>${escapeHtml(item.group)} · ${item.mutating ? "有副作用" : "只读"}</span></div>${statusBadge(item.enabled)}</div>
-    <p>${escapeHtml(item.description || "未填写用途说明")}</p>
-    ${cardActions([`<button class="btn small ${item.enabled ? "danger" : ""}" data-resource-action="capability-toggle" data-id="${escapeHtml(item.name)}">${item.enabled ? "全局停用" : "全局启用"}</button>`])}
+  const guest = key === "users" && isGuestUser(item);
+  const manageable = item.can_manage !== false && (!guest || Auth.role() === "root") && (key !== "mcp" || item.transport !== "stdio" || Auth.role() === "root");
+  const edit = manageable && !guest ? `<button class="btn small ghost" data-resource-action="edit" data-id="${escapeHtml(item.id ?? item.key ?? "")}">编辑</button>` : "";
+  const remove = manageable ? `<button class="btn small danger" data-resource-action="delete" data-id="${escapeHtml(item.id ?? item.key ?? "")}">${guest ? "删除访客及数据" : "删除"}</button>` : "";
+  if (key === "capabilities") return `<article class="resource-row ${item.enabled ? "" : "disabled"}">
+    <div class="resource-primary"><div class="resource-icon">${icon("blocks", 20)}</div><div class="resource-details"><h3>${escapeHtml(item.name)}</h3><p>${escapeHtml(item.description || "未填写用途说明")}</p></div></div>
+    <div class="resource-meta"><span class="tag">${escapeHtml(item.group)}</span><span class="tag ${item.mutating ? "risk-tag" : ""}">${item.mutating ? "写入操作" : "只读"}</span></div>
+    <div class="resource-actions"><button class="tool-switch" type="button" ${Auth.role() !== "root" ? "disabled" : ""} role="switch" aria-checked="${!!item.enabled}" aria-label="${escapeHtml(item.name)} 全局启用" data-resource-action="capability-toggle" data-id="${escapeHtml(item.name)}"><span></span></button><small>${item.enabled ? "已启用" : "已停用"}</small></div>
   </article>`;
   if (key === "knowledge") {
     const files = (item.files || []).map(file => `<span class="file-chip">${icon("paperclip", 12)}${escapeHtml(file)}
@@ -905,16 +1034,16 @@ function resourceCard(item, key) {
     return `<article class="card resource-card">
       <div class="card-title-row"><div><h3>${escapeHtml(item.name)}</h3><span>${escapeHtml(item.key)} · ${manageable ? "我创建的" : "只读，可引用"}</span></div>${statusBadge(item.is_public, "公开", "私有")}</div>
       <div class="resource-stats">${meta("文档", `${(item.files || []).length} 个`)}${meta("类型", item.builtin ? "内置知识库" : "自建知识库")}</div>
-      <div class="file-list">${files || '<span class="hint">尚未上传文档</span>'}</div>
+      <details class="knowledge-documents"><summary>${icon("fileText", 15)}查看文档 <span>${(item.files || []).length}</span></summary><div class="file-list">${files || '<span class="hint">尚未上传文档</span>'}</div></details>
       ${cardActions(manageable ? [
         `<button class="btn small" data-resource-action="upload" data-id="${escapeHtml(item.key)}">上传文档</button>`,
         `<button class="btn small ghost" data-resource-action="edit" data-id="${escapeHtml(item.key)}">可见性</button>`, remove,
       ] : [])}</article>`;
   }
   if (key === "mcp") return `<article class="card resource-card">
-    <div class="card-title-row"><div><h3>${escapeHtml(item.name)}</h3><span>${escapeHtml((item.transport || "http").toUpperCase())} · v${item.version || 0}</span></div>${item.review_required ? '<b class="status cancelled">目录待复核</b>' : statusBadge(item.enabled)}</div>
+    <div class="card-title-row"><div><h3>${escapeHtml(item.name)}</h3><span>${escapeHtml((item.transport || "http").toUpperCase())} · v${item.version || 0}</span></div>${item.transport === "stdio" && !item.stdio_authorized ? '<b class="status cancelled">未获启动授权</b>' : item.review_required ? '<b class="status cancelled">目录待复核</b>' : statusBadge(item.enabled)}</div>
     <p>${escapeHtml(item.description || "未填写用途说明")}</p>
-    <div class="resource-stats">${meta("服务地址", item.url)}${meta("鉴权头", `${Object.keys(item.headers || {}).length} 项`)}${meta("风险策略", item.risk_policy === "read_only" ? "已审核只读" : "自动识别")}${meta("配置哈希", item.content_hash ? item.content_hash.slice(0, 12) : "未建立")}${meta("目录哈希", item.catalog_hash ? item.catalog_hash.slice(0, 12) : "未测试")}</div>
+    <div class="resource-stats">${item.transport === "stdio" ? `${meta("本地程序", manageable ? item.command || "未配置" : "root 共享的本地连接")}${meta("环境变量", `${Object.keys(item.env || {}).length} 项 · 值已隐藏`)}` : `${meta("服务地址", item.url)}${meta("鉴权头", `${Object.keys(item.headers || {}).length} 项`)}`}${meta("风险策略", item.risk_policy === "read_only" ? "已审核只读" : "自动识别")}${meta("配置哈希", item.content_hash ? item.content_hash.slice(0, 12) : "未建立")}${meta("目录哈希", item.catalog_hash ? item.catalog_hash.slice(0, 12) : "未测试")}</div>
     ${cardActions(manageable ? [edit, `<button class="btn small ghost" data-resource-action="test" data-id="${item.id}">测试连接</button>`,
       item.review_required ? `<button class="btn small" data-resource-action="ack-catalog" data-id="${item.id}">确认目录变更</button>` : "",
       `<button class="btn small ghost" data-resource-action="versions" data-id="${item.id}">版本</button>`, `<button class="btn small ghost" data-resource-action="export-one" data-id="${item.id}">导出</button>`, remove] : [])}</article>`;
@@ -942,8 +1071,8 @@ function resourceCard(item, key) {
     const price = governance.price || null;
     const healthLabel = health.state === "healthy" ? "健康" : health.state === "unhealthy" ? "异常" : "待观测";
     return `<article class="card resource-card ${health.state === "unhealthy" ? "disabled" : ""}">
-      <div class="card-title-row"><div><h3>${escapeHtml(item.name)}</h3><span>${item.provider_type === "chatgpt" ? "ChatGPT 订阅（Codex）" : item.provider_type === "anthropic" ? "Anthropic 兼容" : "OpenAI 兼容"} · ${escapeHtml(item.wire_api || "chat_completions")}</span></div>${statusBadge(item.enabled)}</div>
-      <div class="resource-stats">${meta("模型", item.model_name || item.model_id || "未选择")}${meta("输入", (item.model_input || ["text"]).join(" + "))}${meta("健康", `${healthLabel}${health.samples ? ` · ${health.samples} 次` : ""}`)}${meta("平均延迟", health.average_latency_ms ? `${health.average_latency_ms} ms` : "—")}${meta("当前价格", price ? `输入 $${price.input_usd_per_million} / 输出 $${price.output_usd_per_million}` : "未定价")}${meta("对话选择", item.is_public ? "已开放" : "未开放")}</div>
+      <div class="card-title-row"><div><h3>${escapeHtml(providerModelName(item))}</h3><span>${item.provider_type === "chatgpt" ? "ChatGPT 订阅（Codex）" : item.provider_type === "anthropic" ? "Anthropic 兼容" : "OpenAI 兼容"} · ${escapeHtml(item.wire_api || "chat_completions")}</span></div>${statusBadge(item.enabled)}</div>
+      <div class="resource-stats">${meta("模型 ID", item.model_id || "未选择")}${meta("输入", (item.model_input || ["text"]).join(" + "))}${meta("健康", `${healthLabel}${health.samples ? ` · ${health.samples} 次` : ""}`)}${meta("平均延迟", health.average_latency_ms ? `${health.average_latency_ms} ms` : "—")}${meta("当前价格", price ? `输入 $${price.input_usd_per_million} / 输出 $${price.output_usd_per_million}` : "未定价")}${meta("对话选择", item.is_public ? "已开放" : "未开放")}</div>
       <p class="mono-line">${escapeHtml(item.base_url)}</p>
       ${cardActions(manageable ? [edit, `<button class="btn small ghost" data-resource-action="provider-price" data-id="${item.id}">价格版本</button>`, `<button class="btn small ghost" data-resource-action="test" data-id="${item.id}">测试连接</button>`, remove] : [])}</article>`;
   }
@@ -963,10 +1092,48 @@ function resourceCard(item, key) {
       ${cardActions(personalWeixin ? [connectAction, edit, remove] : [edit, `<button class="btn small ghost" data-resource-action="copy-url" data-id="${item.id}">复制地址</button>`, remove])}</article>`;
   }
   if (key === "users") return `<article class="card resource-card">
-    <div class="card-title-row"><div><h3>${escapeHtml(item.username)}</h3><span>${escapeHtml(item.role)}</span></div>${statusBadge(item.is_active, "正常", "已禁用")}</div>
+    <div class="card-title-row"><div><h3>${escapeHtml(item.username)}</h3><span>${guest ? "访客" : escapeHtml(item.role)}</span></div>${statusBadge(item.is_active, "正常", "已禁用")}</div>
     <div class="resource-stats">${meta("权限范围", item.role === "root" ? "全部模块" : item.all_modules ? "全部可用模块" : `${(item.modules || []).length} 个模块`)}</div>
     ${cardActions([edit, remove])}</article>`;
   return "";
+}
+
+function renderResourceTable(rows, key) {
+  const headings = key === "users" ? ["用户", "角色", "模块权限", "状态", "操作"]
+    : key === "keys" ? ["用途名称", "密钥标识", "状态", "操作"]
+    : ["定时任务", "执行计划", "下次执行", "状态", "操作"];
+  const rowHtml = rows.map(item => {
+    const id = escapeHtml(item.id);
+    const guest = key === "users" && isGuestUser(item);
+    const manageable = item.can_manage !== false && (!guest || Auth.role() === "root");
+    const action = (value, label, danger = false) => `<button class="btn small ${danger ? "danger" : "ghost"}" data-resource-action="${value}" data-id="${id}">${label}</button>`;
+    const actions = manageable ? guest ? action("delete", "删除访客及数据", true)
+      : `${key === "keys" ? action("toggle", item.is_active ? "停用" : "启用") : action("edit", "配置")}${action("delete", "删除", true)}` : '<span class="hint">仅查看</span>';
+    const cells = key === "users" ? [
+      `<strong>${escapeHtml(item.username)}</strong>`,
+      `<span class="tag">${escapeHtml(({root: "系统管理员", admin: "管理员", user: "普通用户", guest: "访客"})[item.role] || item.role)}</span>`,
+      item.role === "root" ? "全部模块" : item.all_modules ? "全部可用模块" : `${(item.modules || []).length} 个模块`,
+      statusBadge(item.is_active, "正常", "已禁用"),
+    ] : key === "keys" ? [
+      `<strong>${escapeHtml(item.name)}</strong><small>密钥明文仅在签发时展示</small>`, `<code>${escapeHtml(item.prefix)}…</code>`, statusBadge(item.is_active, "有效", "已停用"),
+    ] : [
+      `<strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.query || "")}</small>`, `<code>${escapeHtml(item.cron)}</code><small>${escapeHtml(item.timezone)}</small>`, formatAuditTime(item.next_run_at), statusBadge(item.enabled),
+    ];
+    return `<tr>${cells.map(cell => `<td>${cell}</td>`).join("")}<td><div class="table-actions">${actions}</div></td></tr>`;
+  }).join("");
+  return `<div class="resource-table-wrap"><table class="resource-table"><thead><tr>${headings.map(label => `<th scope="col">${label}</th>`).join("")}</tr></thead><tbody>${rowHtml}</tbody></table></div>`;
+}
+
+function renderResourceCollection() {
+  const key = state.activeResource;
+  const rows = state.resourceRows.filter(item => matchesCollection(item, state.resourceQuery, state.resourceFilter, key));
+  if ($("resource-count")) $("resource-count").textContent = `${rows.length} / ${state.resourceRows.length} 项`;
+  const grid = $("resource-grid");
+  grid.dataset.layout = ({providers: "models", mcp: "services", skills: "tools", capabilities: "tools", knowledge: "knowledge", users: "table", keys: "table", schedules: "table"})[key] || "cards";
+  if (!rows.length) grid.innerHTML = collectionEmpty(state.resourceQuery || state.resourceFilter !== "all", resources[key].title);
+  else if (["users", "keys", "schedules"].includes(key)) grid.innerHTML = renderResourceTable(rows, key);
+  else grid.innerHTML = rows.map(item => resourceCard(item, key)).join("");
+  grid.onclick = handleResourceAction;
 }
 
 function renderSystemSettings(item) {
@@ -1326,17 +1493,22 @@ function renderArchiveManagement() {
 }
 
 async function loadArchiveManagement() {
+  const request = state.resourceRequest;
+  if (state.currentTab !== "archive") return;
   $("resource-grid").classList.add("list-layout");
   $("resource-grid").innerHTML = '<div class="archive-empty">正在加载…</div>';
   try {
-    [state.archivedConversations, state.archivedProjects] = await Promise.all([
+    const archived = await Promise.all([
       api("/api/v1/chat/turns?archived=true"),
       api("/api/v1/projects?archived=true"),
     ]);
+    if (request !== state.resourceRequest || state.currentTab !== "archive") return;
+    [state.archivedConversations, state.archivedProjects] = archived;
     state.resourceRows = [];
     $("resource-grid").innerHTML = renderArchiveManagement();
     $("resource-grid").onclick = handleArchiveAction;
   } catch (error) {
+    if (request !== state.resourceRequest || state.currentTab !== "archive") return;
     $("resource-grid").innerHTML = `<div class="archive-empty">加载失败：${escapeHtml(error.message)}</div>`;
     $("resource-grid").onclick = null;
   }
@@ -1372,8 +1544,29 @@ async function handleArchiveAction(event) {
 }
 
 async function loadResource(key) {
+  if (state.currentTab && state.currentTab !== key) return;
+  const request = ++state.resourceRequest;
+  const changed = state.activeResource !== key;
   state.activeResource = key;
   const config = resources[key];
+  if (!config) return;
+  if (changed) {
+    state.resourceQuery = "";
+    state.resourceFilter = "all";
+    if ($("resource-search")) $("resource-search").value = "";
+    if ($("resource-filter")) $("resource-filter").value = "all";
+  }
+  state.resourceRows = [];
+  $("resource-grid").onclick = null;
+  $("resource-grid").innerHTML = '<div class="empty-state" role="status">正在加载…</div>';
+  $("resource-grid").dataset.layout = "cards";
+  if ($("resource-toolbar")) $("resource-toolbar").hidden = !!config.directSettings || key === "audit";
+  if ($("resource-count")) $("resource-count").textContent = "加载中";
+  if ($("resource-filter")) {
+    const visibility = key === "knowledge";
+    $("resource-filter").innerHTML = `<option value="all">全部${visibility ? "可见性" : "状态"}</option><option value="enabled">${visibility ? "公开" : "已启用"}</option><option value="disabled">${visibility ? "私有" : "已停用"}</option>${["providers", "skills", "templates", "mcp"].includes(key) ? '<option value="public">已共享</option>' : ""}`;
+    $("resource-filter").value = state.resourceFilter;
+  }
   $("resource-title").textContent = config.title;
   $("resource-copy").textContent = config.copy;
   $("resource-actions").hidden = !!config.directSettings;
@@ -1381,12 +1574,14 @@ async function loadResource(key) {
   $("resource-create-label").textContent = config.createLabel || "新建";
   $("resource-import").hidden = !(config.importLabel || config.importEndpoint || config.importType);
   $("resource-import-label").textContent = config.importLabel || "导入";
-  $("resource-clear").hidden = !config.clearLabel;
-  $("resource-clear").disabled = !!config.clearLabel;
-  $("resource-clear-label").textContent = config.clearLabel || "清空";
+  const clearLabel = key === "users" && Auth.role() !== "root" ? "" : config.clearLabel;
+  $("resource-clear").hidden = !clearLabel;
+  $("resource-clear").disabled = !!clearLabel;
+  $("resource-clear-label").textContent = clearLabel || "清空";
   $("resource-export").hidden = !(config.exportLabel || config.exportEndpoint || config.exportType);
   $("resource-export-label").textContent = config.exportLabel || "导出";
   $("resource-import-input").accept = config.importAccept || "";
+  try {
   if (config.archiveManagement) {
     await loadArchiveManagement();
     return;
@@ -1395,8 +1590,9 @@ async function loadResource(key) {
     ? `${config.endpoint}?limit=${state.auditPageSize}&offset=${state.auditPage * state.auditPageSize}`
     : key === "token-usage"
       ? `${config.endpoint}?days=${state.tokenDays}${state.tokenUserId ? `&user_id=${encodeURIComponent(state.tokenUserId)}` : ""}`
-    : config.endpoint;
+    : key === "capabilities" && Auth.role() !== "root" ? "/api/v1/capabilities" : config.endpoint;
   let response = await api(requestEndpoint);
+  if (request !== state.resourceRequest) return;
   if (key === "token-usage") {
     try {
       response.model_costs = await api(
@@ -1409,6 +1605,7 @@ async function loadResource(key) {
   if (key === "providers") {
     try {
       const governance = await api("/api/v1/model-governance/providers?lookback_minutes=60");
+      if (request !== state.resourceRequest) return;
       state.providerGovernance = new Map(
         (governance?.items || []).map(item => [Number(item.provider_id), item])
       );
@@ -1416,6 +1613,7 @@ async function loadResource(key) {
       state.providerGovernance = new Map();
     }
   }
+  if (request !== state.resourceRequest) return;
   let rows;
   if (key === "settings" || key === "token-usage") rows = [response || {}];
   else if (key === "audit") {
@@ -1428,8 +1626,9 @@ async function loadResource(key) {
     }
     rows = response?.items || [];
   }
-  else rows = Array.isArray(response) ? response : [];
+  else rows = key === "capabilities" && !Array.isArray(response) ? response.builtin_tools || [] : Array.isArray(response) ? response : [];
   state.resourceRows = rows;
+  if (key === "users") $("resource-clear").disabled = Auth.role() !== "root" || state.guestCleanupPending || !rows.some(isGuestUser);
   if (key === "knowledge") {
     // Uploading changes a knowledge base. Keep the page-level shortcut aligned
     // with the per-card ownership controls instead of opening a form that will
@@ -1466,8 +1665,13 @@ async function loadResource(key) {
     };
     $("resource-grid").onclick = null;
   } else {
-    $("resource-grid").innerHTML = rows.map(item => resourceCard(item, key)).join("") || '<div class="empty-state">暂无数据</div>';
-    $("resource-grid").onclick = handleResourceAction;
+    renderResourceCollection();
+  }
+  } catch (error) {
+    if (request !== state.resourceRequest) return;
+    $("resource-grid").innerHTML = `<div class="empty-state"><strong>加载失败</strong><span>${escapeHtml(error.message)}</span><button class="btn ghost" id="resource-retry">重试</button></div>`;
+    if ($("resource-count")) $("resource-count").textContent = "加载失败";
+    $("resource-retry").onclick = () => loadResource(key);
   }
 }
 
@@ -1484,9 +1688,14 @@ function showResult(title, copy, value) {
   $("result-dialog").showModal();
 }
 
+function mcpTestResultText(result) {
+  const tools = Array.isArray(result?.tools) ? result.tools : [];
+  return tools.length ? tools.map((tool, index) => `${index + 1}. ${String(tool?.name || "未命名工具")}\n   ${String(tool?.description || "未提供工具说明")}`).join("\n\n") : "连接成功，服务当前未提供任何工具。";
+}
+
 async function authorizedFetch(path, options = {}) {
   const headers = new Headers(options.headers || {});
-  const response = await fetch(path, {...options, headers});
+  const response = await fetch(path, {...options, headers, credentials: "same-origin"});
   if (!response.ok) {
     let detail = response.statusText;
     try { detail = (await response.json()).detail || detail; } catch (_) {}
@@ -1580,14 +1789,19 @@ function openTemplateFileReplace(item) {
 
 async function handleResourceAction(event) {
   const button = event.target.closest("[data-resource-action]");
-  if (!button) return;
+  if (!button || button.disabled) return;
   const action = button.dataset.resourceAction;
   const item = currentResourceItem(button.dataset.id);
-  const config = resources[state.activeResource];
+  const key = state.activeResource;
+  const config = resources[key];
+  if (!item || !config) return;
+  if (key === "users" && (state.guestCleanupPending || (isGuestUser(item) && (Auth.role() !== "root" || action === "edit")))) return;
+  const refresh = () => state.currentTab === key ? loadResource(key) : Promise.resolve();
+  button.disabled = true;
   try {
     if (action === "edit") {
-      await ensureResourceDependencies(state.activeResource);
-      openResourceEditor(item);
+      await ensureResourceDependencies(key);
+      if (state.currentTab === key) openResourceEditor(item);
     }
     else if (action === "provider-price") await openProviderPriceDialog(item);
     else if (action === "versions") {
@@ -1597,58 +1811,66 @@ async function handleResourceAction(event) {
     else if (action === "ack-catalog") {
       await api(`/api/v1/mcp-servers/${item.id}/acknowledge-catalog`, {method: "POST"});
       showToast("已确认当前 MCP 能力目录，可用于新任务");
-      await loadResource("mcp");
+      await refresh();
     }
     else if (action === "scan-weixin") await openWeixinLogin(item.id);
     else if (action === "disconnect-weixin") {
       if (!confirm("确认解绑当前微信？已有网页对话会保留，但微信将停止收发消息。")) return;
       await api(`/api/v1/channels/${item.id}/disconnect`, {method: "POST"});
       showToast("微信已解绑");
-      await loadResource("channels");
+      await refresh();
     }
     else if (action === "upload") openKnowledgeImport(item?.key);
     else if (action === "replace-file") openTemplateFileReplace(item);
     else if (action === "delete") {
-      const deleteMessage = state.activeResource === "users"
-        ? `确认删除用户“${resourceName(item)}”？该账号的运行产物将一并永久删除；其他关联业务数据仍需先转移或删除。此操作不可撤销。`
+      const deleteMessage = key === "users"
+        ? isGuestUser(item)
+          ? `确认删除访客“${resourceName(item)}”及关联数据？聊天记录、任务、附件和私人模型将永久清除，当前访客会话也将失效。此操作不可撤销。`
+          : `确认删除用户“${resourceName(item)}”？该账号的运行产物将一并永久删除；其他关联业务数据仍需先转移或删除。此操作不可撤销。`
         : `确认删除“${resourceName(item)}”？此操作不可撤销。`;
       if (!confirm(deleteMessage)) return;
-      const endpoint = state.activeResource === "knowledge"
+      const endpoint = key === "knowledge"
         ? `/api/v1/knowledge/datasets/${encodeURIComponent(item.key)}`
         : `${config.endpoint}/${item.id}`;
-      await api(endpoint, {method: "DELETE"});
-      await loadResource(state.activeResource);
+      const result = await api(endpoint, {method: "DELETE"});
+      if (key === "users" && isGuestUser(item)) reportGuestCleanup(result);
+      await refresh();
     } else if (action === "delete-file") {
       if (!confirm(`确认从知识库删除文档“${button.dataset.file}”？`)) return;
       await api(`/api/v1/knowledge/${encodeURIComponent(button.dataset.id)}/${encodeURIComponent(button.dataset.file)}`, {method: "DELETE"});
-      await loadResource("knowledge");
+      await refresh();
     } else if (action === "test") {
       button.disabled = true;
       button.textContent = "测试中…";
       const result = await api(`${config.endpoint}/${item.id}/test`, {method: "POST"});
-      showToast(result?.reply ? `连接成功：${result.reply}` : "连接测试成功");
-      await loadResource(state.activeResource);
+      if (key === "mcp" && state.currentTab === key) {
+        showResult(`${item.name} · 工具目录`, `连接成功，发现 ${Array.isArray(result?.tools) ? result.tools.length : 0} 个工具。工具能力由该服务提供；测试未执行任何工具。`, mcpTestResultText(result));
+      } else if (state.currentTab === key) {
+        showToast(result?.reply ? `连接成功：${result.reply}` : "连接测试成功");
+      }
+      await refresh();
     } else if (action === "export-one") {
-      if (state.activeResource === "skills") await downloadEndpoint(`/api/v1/skills/${item.id}/export`, `${item.name}.zip`);
-      else if (state.activeResource === "templates") await downloadEndpoint(`/api/v1/templates/${item.id}/export`, `${item.name}.zip`);
+      if (key === "skills") await downloadEndpoint(`/api/v1/skills/${item.id}/export`, `${item.name}.zip`);
+      else if (key === "templates") await downloadEndpoint(`/api/v1/templates/${item.id}/export`, `${item.name}.zip`);
       else await downloadEndpoint(`/api/v1/mcp-servers/export?ids=${item.id}`, `${item.name}.json`);
     } else if (action === "download") {
       await downloadEndpoint(`/api/v1/templates/${item.id}/download`, `${item.name}${item.ext || ""}`);
     } else if (action === "toggle") {
       await api(`${config.endpoint}/${item.id}`, {method: "PATCH"});
-      await loadResource(state.activeResource);
+      await refresh();
     } else if (action === "capability-toggle") {
       await api(`/api/v1/capabilities/${encodeURIComponent(item.name)}`, {
         method: "PATCH", json: {enabled: !item.enabled},
       });
       await loadCatalogs();
-      await loadResource("capabilities");
+      await refresh();
     } else if (action === "copy-url") {
       await copyText(item.webhook_url || item.webhook_path || "");
       showToast("接入地址已复制");
     }
   } catch (error) {
     showToast(error.message);
+  } finally {
     if (button.isConnected) {
       button.disabled = false;
       if (action === "test") button.textContent = "测试连接";
@@ -1658,7 +1880,7 @@ async function handleResourceAction(event) {
 
 async function openProviderPriceDialog(item) {
   state.providerPriceId = Number(item.id);
-  $("provider-price-name").textContent = `${item.name} · ${item.model_id || "未选择模型"}`;
+  $("provider-price-name").textContent = `${providerModelName(item)} · ${item.model_id || "未选择模型"}`;
   $("provider-price-error").textContent = "";
   const response = await api(`/api/v1/model-governance/providers/${item.id}/prices`);
   const latest = (response?.items || []).at(-1) || {};
@@ -1795,8 +2017,39 @@ async function triggerResourceImport() {
   $("resource-import-input").click();
 }
 
+function reportGuestCleanup(result) {
+  const count = Number.isInteger(result?.deleted_users) ? `${result.deleted_users} 个` : "";
+  const warnings = Array.isArray(result?.cleanup_warnings) ? result.cleanup_warnings : [];
+  if (warnings.length) {
+    showToast(`已删除${count}访客账号；部分文件清理未完成`);
+    showResult("访客清理结果", "访客账号已删除，以下文件清理仍需处理。", warnings.join("\n"));
+  } else showToast(`已删除${count}访客及关联数据`);
+}
+
+async function clearGuestUsers() {
+  if (Auth.role() !== "root" || state.activeResource !== "users" || state.guestCleanupPending) return;
+  const button = $("resource-clear");
+  if (button.disabled || !state.resourceRows.some(isGuestUser)) return;
+  if (!confirm("确定清理全部访客账号及关联数据？聊天记录、任务、附件和私人模型将永久清除，当前访客会话也将失效。此操作不可撤销。")) return;
+  state.guestCleanupPending = true;
+  button.disabled = true;
+  try {
+    const result = await api("/api/v1/users/guests", {method: "DELETE"});
+    reportGuestCleanup(result);
+    if (state.currentTab === "users") await loadResource("users");
+  } catch (error) {
+    showToast(`清理访客失败：${error.message}`);
+  } finally {
+    state.guestCleanupPending = false;
+    if (state.activeResource === "users" && state.currentTab === "users") {
+      button.disabled = !state.resourceRows.some(isGuestUser);
+    }
+  }
+}
+
 async function clearResource() {
   const key = state.activeResource;
+  if (key === "users") return clearGuestUsers();
   const config = resources[key];
   if (!config?.clearLabel || key !== "audit" || state.auditTotal === 0) return;
   if (!confirm(`确定清空全部 ${state.auditTotal.toLocaleString()} 条操作日志吗？此操作不可撤销。`)) return;
@@ -1833,7 +2086,7 @@ async function exportResource() {
         model_list_path: item.model_list_path, model_id: item.model_id,
         model_name: item.model_name, model_input: item.model_input,
         model_reasoning: item.model_reasoning, context_window: item.context_window,
-        reasoning_effort: item.reasoning_effort, max_tokens: item.max_tokens,
+        reasoning_effort: item.reasoning_effort, reasoning_config: item.reasoning_config, max_tokens: item.max_tokens,
         max_tokens_param: item.max_tokens_param,
         supports_temperature: item.supports_temperature, timeout_ms: item.timeout_ms,
         max_retries: item.max_retries, stream_max_retries: item.stream_max_retries,
@@ -1858,7 +2111,7 @@ async function importAgents(file) {
 }
 
 async function exportAgents() {
-  const ids = [...document.querySelectorAll("[data-agent-select]:checked")].map(input => input.value);
+  const ids = [...state.selectedAgents];
   if (!ids.length) { showToast("请先勾选要导出的智能体"); return; }
   try { await downloadEndpoint(`/api/v1/agents/export?ids=${ids.join(",")}`, "agents.json"); }
   catch (error) { showToast(error.message); }
@@ -1955,35 +2208,176 @@ async function handleOperationsAction(event) {
   }
 }
 
+const toolPages = [["capabilities", "内置工具", "tools"], ["mcp", "MCP", "mcp"], ["skills", "Skill", "skills"], ["http-services", "网络服务", "services"], ["program-services", "编程服务", "services"]];
+const personalPages = ["preferences", "projects", "conversation-memory"];
+
+function canOpenAdminPage(name) {
+  name = String(name || "").split("/")[0];
+  if (["preferences", "projects", "conversation-memory"].includes(name)) return true;
+  if (name === "tools") return toolPages.some(([, , module]) => Auth.canModule(module));
+  const tool = toolPages.find(([key]) => key === name);
+  if (tool) return Auth.canModule(tool[2]);
+  const tab = [...document.querySelectorAll(".tab")].find(item => item.dataset.tab === name);
+  return !!tab && tab.style.display !== "none";
+}
+
+function adminCategoryPage(category) {
+  const group = document.querySelector(`[data-admin-category="${category}"]`);
+  if (!group) return null;
+  const available = [...group.querySelectorAll(".tab")].filter(tab => tab.style.display !== "none");
+  if (!available.length) return null;
+  const remembered = state.categoryPages[category];
+  if (remembered && canOpenAdminPage(remembered)) return remembered;
+  return available[0].dataset.tab;
+}
+
+function syncAdminNavigation(name, route) {
+  const key = toolPages.some(([page]) => page === name) ? "tools" : name;
+  const selected = document.querySelector(`.tab[data-tab="${key}"]`);
+  const category = selected?.closest("[data-admin-category]")?.dataset.adminCategory;
+  if (!category) return;
+  state.categoryPages[category] = route;
+  document.querySelectorAll("[data-admin-category]").forEach(group => {
+    group.hidden = group.dataset.adminCategory !== category;
+  });
+  document.querySelectorAll("[data-category]").forEach(button => {
+    const active = button.dataset.category === category;
+    button.classList.toggle("active", active);
+    if (active) button.setAttribute("aria-current", "true");
+    else button.removeAttribute("aria-current");
+  });
+  // Reveal the selected item inside the horizontal rail without moving the page.
+  const group = selected.parentElement;
+  const left = selected.offsetLeft - group.offsetLeft;
+  if (left < group.scrollLeft) group.scrollLeft = left;
+  else if (left + selected.offsetWidth > group.scrollLeft + group.clientWidth) {
+    group.scrollLeft = left + selected.offsetWidth - group.clientWidth;
+  }
+}
+
+function adminNavigationKey(event, buttons, vertical = false) {
+  const visible = [...buttons].filter(button => !button.hidden && button.style.display !== "none" && !button.closest("[hidden]"));
+  const index = visible.indexOf(event.currentTarget);
+  if (index < 0) return;
+  let target;
+  if (event.key === (vertical ? "ArrowDown" : "ArrowRight")) target = (index + 1) % visible.length;
+  if (event.key === (vertical ? "ArrowUp" : "ArrowLeft")) target = (index + visible.length - 1) % visible.length;
+  if (event.key === "Home") target = 0;
+  if (event.key === "End") target = visible.length - 1;
+  if (target == null) return;
+  event.preventDefault();
+  visible[target].focus({preventScroll: true});
+  visible[target].scrollIntoView({block: "nearest", inline: "nearest"});
+}
+
 function showPanel(name) {
-  const tab = document.querySelector(`.tab[data-tab="${name}"]`);
-  if (!tab || tab.style.display === "none") return;
+  if (!canOpenAdminPage(name)) return;
+  const requestedHash = name;
+  name = String(name).split("/")[0];
+  const personalPage = personalPages.includes(name);
+  if (name === "tools") name = toolPages.find(([, , module]) => Auth.canModule(module))[0];
+  const tool = toolPages.find(([key]) => key === name);
+  const servicesPage = ["services", "http-services", "program-services"].includes(name);
+  const tab = document.querySelector(`.tab[data-tab="${tool ? "tools" : name}"]`);
+  if (state.currentTab === "guardrails" && name !== "guardrails") window.GuardrailsAdmin?.leave();
+  if (state.currentTab === "memory" && name !== "memory") window.MemoryAdmin?.leave();
+  window.ServicesAdmin?.leave();
+  window.PersonalSettings?.leave?.();
+  state.currentTab = name;
+  ++state.resourceRequest;
   document.querySelectorAll(".tab").forEach(item => {
-    const active = item.dataset.tab === name;
+    const active = item.dataset.tab === (tool ? "tools" : name);
     item.classList.toggle("active", active);
     if (active) item.setAttribute("aria-current", "page");
     else item.removeAttribute("aria-current");
   });
-  if (window.matchMedia("(max-width: 760px)").matches) {
-    tab.scrollIntoView({behavior: "smooth", block: "nearest", inline: "center"});
-  }
+  setAdminMenu(false);
+  if ($("admin-page-label")) $("admin-page-label").textContent = tool ? `工具 / ${tool[1]}` : tab.textContent.trim();
+  $("tools-subnav").hidden = !tool;
+  $("tools-subnav").innerHTML = tool ? toolPages.filter(([, , module]) => Auth.canModule(module)).map(([key, label]) => `<button type="button" data-tool-page="${key}" class="${key === name ? "active" : ""}" ${key === name ? 'aria-current="page"' : ""}>${label}</button>`).join("") : "";
+  $("tools-subnav").querySelectorAll("[data-tool-page]").forEach(button => button.onclick = () => showPanel(button.dataset.toolPage));
   $("panel-agents").hidden = name !== "agents";
   $("panel-improvement").hidden = name !== "improvement";
   $("panel-operations").hidden = name !== "operations";
-  $("panel-resource").hidden = ["agents", "improvement", "operations"].includes(name);
-  if (name === "agents") loadAgents();
-  else if (name === "improvement") loadImprovement();
-  else if (name === "operations") loadOperations();
-  else loadResource(name);
+  if ($("panel-memory")) $("panel-memory").hidden = name !== "memory";
+  if ($("panel-guardrails")) $("panel-guardrails").hidden = name !== "guardrails";
+  $("panel-services").hidden = !servicesPage;
+  $("panel-personal").hidden = !personalPage;
+  $("panel-resource").hidden = personalPage || servicesPage || ["agents", "improvement", "operations", "guardrails", "memory"].includes(name);
+  const targetHash = personalPage ? requestedHash : name;
+  syncAdminNavigation(name, targetHash);
+  if (location.hash !== `#${targetHash}`) history.replaceState(null, "", `#${targetHash}`);
+  const load = personalPage ? () => window.PersonalSettings?.load(name)
+    : name === "agents" ? loadAgents
+    : name === "memory" ? () => window.MemoryAdmin?.load()
+    : servicesPage ? () => window.ServicesAdmin?.load({kind: name === "http-services" ? "http" : name === "program-services" ? "program" : ""})
+    : name === "improvement" ? loadImprovement
+    : name === "operations" ? loadOperations
+    : name === "guardrails" ? () => window.GuardrailsAdmin?.load()
+    : () => loadResource(name);
+  Promise.resolve().then(load).catch(error => {
+    if (state.currentTab !== name) return;
+    showToast(`加载失败：${error.message}`);
+    const target = $(personalPage ? "personal-settings-content" : name === "memory" ? "memory-content" : name === "agents" ? "agents-grid" : "runs-list");
+    if (target) {
+      target.innerHTML = `<div class="empty-state"><strong>加载失败</strong><span>${escapeHtml(error.message)}</span><button class="btn ghost" data-panel-retry>重试</button></div>`;
+      target.querySelector("[data-panel-retry]").onclick = () => showPanel(name);
+    }
+  });
   localStorage.setItem("harness_admin_tab", name);
 }
 
+function setAdminMenu(open) {
+  document.body.classList.toggle("admin-menu-open", open);
+  if ($("admin-menu-toggle")) $("admin-menu-toggle").setAttribute("aria-expanded", String(open));
+  if ($("admin-sidebar-overlay")) $("admin-sidebar-overlay").hidden = !open;
+}
+
 const tabModuleKey = tab => tab === "token-usage" ? "token_usage" : tab;
+async function initializeAdmin() {
+  const user = await Auth.requireLogin();
+  if (!user) return;
+  Theme.usePreferences(await api("/api/v1/users/me/preferences"));
+  initTopbar();
+  document.body.classList.remove("auth-pending");
+  document.body.removeAttribute("aria-busy");
+  $("admin-auth-status").hidden = true;
 document.querySelectorAll(".root-only").forEach(el => el.style.display = Auth.role() === "root" ? "" : "none");
 document.querySelectorAll(".tab:not(.root-only)").forEach(tab => {
-  tab.style.display = Auth.canModule(tabModuleKey(tab.dataset.tab)) ? "" : "none";
+  tab.style.display = (personalPages.includes(tab.dataset.tab) || (tab.dataset.tab === "tools" ? canOpenAdminPage("tools") : Auth.canModule(tabModuleKey(tab.dataset.tab)))) ? "" : "none";
 });
-document.querySelectorAll(".tab").forEach(tab => tab.onclick = () => showPanel(tab.dataset.tab));
+document.querySelectorAll("[data-category]").forEach(button => {
+  button.hidden = !adminCategoryPage(button.dataset.category);
+  button.onclick = () => {
+    const page = adminCategoryPage(button.dataset.category);
+    if (!page) return;
+    const mobileOpen = document.body.classList.contains("admin-menu-open");
+    showPanel(page);
+    if (mobileOpen) document.querySelector('#admin-section-tabs .tab[aria-current="page"]')?.focus({preventScroll: true});
+  };
+  button.onkeydown = event => adminNavigationKey(event, document.querySelectorAll("[data-category]"), true);
+});
+if ($("admin-menu-toggle")) $("admin-menu-toggle").onclick = () => setAdminMenu(!document.body.classList.contains("admin-menu-open"));
+if ($("admin-sidebar-overlay")) $("admin-sidebar-overlay").onclick = () => setAdminMenu(false);
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && document.body.classList.contains("admin-menu-open")) {
+    setAdminMenu(false);
+    $("admin-menu-toggle")?.focus();
+  }
+});
+if ($("agent-search")) $("agent-search").oninput = event => { state.agentQuery = event.target.value; renderAgents(); };
+if ($("agent-filter")) $("agent-filter").onchange = event => { state.agentFilter = event.target.value; renderAgents(); };
+if ($("resource-search")) $("resource-search").oninput = event => { state.resourceQuery = event.target.value; renderResourceCollection(); };
+if ($("resource-filter")) $("resource-filter").onchange = event => { state.resourceFilter = event.target.value; renderResourceCollection(); };
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.onclick = () => showPanel(tab.dataset.tab);
+  tab.onkeydown = event => adminNavigationKey(event, tab.parentElement.querySelectorAll(".tab"));
+});
+window.addEventListener("hashchange", () => {
+  const requested = location.hash.slice(1);
+  const allowed = canOpenAdminPage(requested);
+  if (allowed) showPanel(requested);
+});
 document.querySelectorAll("[data-close]").forEach(button => button.onclick = () => $(button.dataset.close).close());
 $("new-agent").onclick = () => openAgent();
 $("agent-save").onclick = saveAgent;
@@ -1997,10 +2391,11 @@ $("new-proposal").onclick = openProposal;
 $("proposal-save").onclick = saveProposal;
 $("resource-create").onclick = async () => {
   const button = $("resource-create");
+  const key = state.activeResource;
   button.disabled = true;
   try {
-    await ensureResourceDependencies(state.activeResource);
-    openResourceEditor(resources[state.activeResource]?.singleton ? state.resourceRows[0] : null);
+    await ensureResourceDependencies(key);
+    if (state.currentTab === key) openResourceEditor(resources[key]?.singleton ? state.resourceRows[0] : null);
   } catch (error) {
     showToast(`加载智能体失败：${error.message}`);
   } finally {
@@ -2035,14 +2430,26 @@ $("token-limit-save").onclick = saveTokenLimits;
 
 hydrateIcons();
 loadCatalogs().then(() => {
-  const remembered = localStorage.getItem("harness_admin_tab");
+  const remembered = location.hash.slice(1) || localStorage.getItem("harness_admin_tab");
   const visibleTabs = [...document.querySelectorAll(".tab")].filter(item => item.style.display !== "none");
-  const tab = visibleTabs.find(item => item.dataset.tab === remembered) || visibleTabs[0];
+  const tab = visibleTabs[0];
   if (!tab) {
     $("agents-grid").innerHTML = '<div class="fatal-state">当前账号没有可访问的设置模块</div>';
     return;
   }
-  showPanel(tab.dataset.tab);
+  showPanel(canOpenAdminPage(remembered) ? remembered : tab.dataset.tab);
 }).catch(error => {
   $("agents-grid").innerHTML = `<div class="fatal-state">加载失败：${escapeHtml(error.message)}</div>`;
+});
+
+}
+initializeAdmin().catch(error => {
+  $("admin-auth-status").textContent = `无法打开后台管理：${error.message}。请刷新重试。`;
+  $("admin-auth-status").setAttribute("role", "alert");
+});
+window.addEventListener("pageshow", event => {
+  if (event.persisted) Auth.requireLogin().then(user => { if (user) location.reload(); }).catch(error => showToast(error.message));
+});
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && Auth.user) Auth.verifyCurrentSession().catch(error => showToast(error.message));
 });

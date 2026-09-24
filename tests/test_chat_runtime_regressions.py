@@ -698,6 +698,107 @@ class ChatRuntimeRegressionTests(unittest.TestCase):
         self.assertEqual(fake.payloads[1]["reasoning_effort"], "low")
         self.assertIn("不得返回空内容", fake.payloads[1]["messages"][-1]["content"])
 
+    def test_nonstream_recovery_preserves_explicit_effort_in_http_body(self):
+        for protocol in ("responses", "messages"):
+            for effort in ("max", "none", ""):
+                with self.subTest(protocol=protocol, effort=effort):
+                    client = LLMClient(
+                        base_url="https://fixture.invalid/v1", api_key="fixture",
+                        model_id="fixture-model", wire_api=protocol,
+                        reasoning_effort=effort, max_retries=0,
+                    )
+                    requests = []
+
+                    async def handler(request):
+                        requests.append(json.loads(request.content))
+                        content = {"type": "text", "text": "recovered answer"}
+                        body = {"content": [content]}
+                        if protocol == "responses":
+                            content["type"] = "output_text"
+                            body = {"output": [{"type": "message", "content": [content]}]}
+                        return httpx.Response(200, json=body)
+
+                    async def run():
+                        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as fake:
+                            with patch("backend.llm.client.get_http_client", return_value=fake):
+                                return await client._recover_empty_message(
+                                    [{"role": "user", "content": "answer"}], 0.2,
+                                    reasoning_chars=42,
+                                )
+
+                    self.assertEqual(asyncio.run(run())["content"], "recovered answer")
+                    self.assertEqual(len(requests), 1)
+                    actual = (requests[0]["reasoning"]["effort"] if protocol == "responses"
+                              else requests[0]["output_config"]["effort"])
+                    self.assertEqual(actual, effort or "low")
+                    self.assertNotIn("tools", requests[0])
+
+    def test_stream_recovery_preserves_explicit_effort_in_both_http_requests(self):
+        for protocol in ("responses", "chat_completions"):
+            for effort in ("high", "none", ""):
+                with self.subTest(protocol=protocol, effort=effort):
+                    # This known recovery trigger exercises the actual stream
+                    # entry point, independently of the model capability catalog.
+                    client = LLMClient(
+                        base_url="https://fixture.invalid/v1", api_key="fixture",
+                        model_id="openai/gpt-oss-20b", wire_api=protocol,
+                        reasoning_effort=effort, max_retries=0, stream_max_retries=0,
+                    )
+                    requests = []
+
+                    async def handler(request):
+                        body = json.loads(request.content)
+                        requests.append(body)
+                        if body.get("stream"):
+                            event = ({"type": "response.completed", "response": {"output": []}}
+                                     if protocol == "responses" else {"choices": [{
+                                         "delta": {"reasoning_content": "fixture reasoning"},
+                                         "finish_reason": "length",
+                                     }]})
+                            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                                  content=f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n")
+                        result = ({"output": [{"type": "message", "content": [
+                            {"type": "output_text", "text": "recovered answer"},
+                        ]}]} if protocol == "responses" else {
+                            "choices": [{"message": {"content": "recovered answer"}}],
+                        })
+                        return httpx.Response(200, json=result)
+
+                    async def run():
+                        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as fake:
+                            with patch("backend.llm.client.get_http_client", return_value=fake):
+                                return await client.chat_messages_stream([
+                                    {"role": "user", "content": "answer"},
+                                ])
+
+                    self.assertEqual(asyncio.run(run()), "recovered answer")
+                    self.assertEqual(len(requests), 2)
+                    self.assertTrue(requests[0]["stream"])
+                    self.assertFalse(requests[1]["stream"])
+                    self.assertNotIn("stream_options", requests[1])
+                    expected = effort or "low"
+                    actual = (requests[1]["reasoning"]["effort"] if protocol == "responses"
+                              else requests[1]["reasoning_effort"])
+                    self.assertEqual(actual, expected)
+                    if effort:
+                        first = (requests[0]["reasoning"]["effort"] if protocol == "responses"
+                                 else requests[0]["reasoning_effort"])
+                        self.assertEqual(first, effort)
+
+    def test_gpt_oss_tool_response_recovery_keeps_explicit_effort(self):
+        client = LLMClient(
+            base_url="https://fixture.invalid/v1", api_key="fixture",
+            model_id="openai/gpt-oss-20b", reasoning_effort="high",
+        )
+        fake = _ReasoningOnlyNonstreamHttpClient()
+
+        async def run():
+            with patch("backend.llm.client.get_http_client", return_value=fake):
+                return await client.chat_with_tools([{"role": "user", "content": "answer"}])
+
+        self.assertEqual(asyncio.run(run())["content"], "恢复后的非流式答案")
+        self.assertEqual([body["reasoning_effort"] for body in fake.payloads], ["high", "high"])
+
     def test_gpt_oss_retries_harmony_header_error_with_stable_tool_temperature(self):
         client = LLMClient(
             base_url="https://integrate.api.nvidia.com/v1",

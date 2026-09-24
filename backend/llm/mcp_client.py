@@ -1,12 +1,15 @@
 """最小 MCP（Model Context Protocol）客户端：列出并调用 MCP 服务的工具。
 
-支持两种传输：
+支持三种传输：
 - http  Streamable HTTP（现行 MCP 标准，推荐）：JSON-RPC 直接 POST 到同一 url，
         响应可能是 application/json 或 text/event-stream。
 - sse   旧式 HTTP+SSE 两通道：先 GET url 拿 endpoint 事件给出的消息地址，
         再 POST 请求、从 SSE 流读取对应 id 的响应。
+- stdio root 授权的本地进程：以 UTF-8 换行 JSON-RPC 完成握手、工具发现与调用；
+        Windows 隐藏窗口，并在退出、超时或取消时清理进程树。
 
-仅依赖 httpx；异常统一抛 RuntimeError（含原因），由调用方决定降级策略。
+HTTP/SSE 依赖 httpx，stdio 使用标准库子进程与线程；本地服务须有可用的运行时。
+异常统一抛 RuntimeError（含原因），由调用方决定降级策略。
 工具在对话循环中以 `服务名__工具名` 命名空间暴露给模型。
 """
 import asyncio
@@ -15,6 +18,10 @@ import json
 import logging
 import os
 import re
+import shutil
+import signal
+import subprocess
+import threading
 from typing import Any, Optional
 
 import httpx
@@ -212,6 +219,9 @@ def flatten_tool_result(result: dict) -> str:
     """把 MCP tools/call 结果（content 数组）压平为字符串供模型阅读。"""
     if not isinstance(result, dict):
         return str(result)
+    if "structuredContent" in result:
+        # 保留机器可读结果和 isError。旧文本调用者仍收到 str，但证据不会被丢弃。
+        return json.dumps(result, ensure_ascii=False)
     parts: list[str] = []
     for item in result.get("content", []) or []:
         if not isinstance(item, dict):
@@ -224,6 +234,347 @@ def flatten_tool_result(result: dict) -> str:
     if result.get("isError"):
         text = f"[工具返回错误] {text}"
     return text or json.dumps(result, ensure_ascii=False)
+
+
+# ---------- Local stdio transport ----------
+
+_STDIO_MAX_MESSAGE = 4 * 1024 * 1024
+_STDIO_STDERR_LIMIT = 4096
+_STDIO_ENV_KEYS = {
+    "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP",
+    "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+    "LANG", "LC_ALL", "LC_CTYPE",
+}
+
+
+def _json_field(raw, expected, default):
+    if isinstance(raw, expected):
+        return raw
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+            if isinstance(value, expected):
+                return value
+        except (ValueError, TypeError):
+            pass
+    return default
+
+
+def validate_stdio_config(command: str, args: list, env: dict, cwd: str) -> None:
+    if not command or not command.strip() or any(char in command for char in "\0\r\n"):
+        raise ValueError("stdio 必须填写已安装的可执行文件路径或名称")
+    if len(args) > 100 or any(not isinstance(arg, str) or "\0" in arg or len(arg) > 65536 for arg in args):
+        raise ValueError("stdio 参数必须是字符串数组，最多 100 项，且不得包含空字符")
+    if len(env) > 100 or any(
+        not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key))
+        or not isinstance(value, str) or "\0" in value or len(value) > 65536
+        for key, value in env.items()
+    ):
+        raise ValueError("stdio 环境变量须为有效名称与字符串值，最多 100 项")
+    if any(char in cwd for char in "\0\r\n"):
+        raise ValueError("stdio 工作目录无效")
+
+
+def stdio_environment(configured: dict) -> dict:
+    # Never inherit the application .env wholesale. Only deployment basics and
+    # explicitly configured values are passed to the authorized subprocess.
+    result = {key: value for key, value in os.environ.items() if key.upper() in _STDIO_ENV_KEYS}
+    result.update({"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"})
+    result.update({key: _expand_env(value) for key, value in configured.items()})
+    return result
+
+
+def resolve_stdio_argv(command: str, args: list[str], environment: dict) -> list[str]:
+    """Resolve an explicitly authorized command without invoking a shell.
+
+    npm ships Windows .cmd wrappers. Execute its installed JS entry point with
+    Node directly; never interpret arbitrary batch files or change root's args.
+    """
+    search_path = next((value for key, value in environment.items() if key.upper() == "PATH"), None)
+    resolved = shutil.which(command, path=search_path)
+    if not resolved:
+        raise RuntimeError("stdio 可执行文件不存在；请先在服务器部署该 MCP 服务")
+    if os.name != "nt" or os.path.splitext(resolved)[1].lower() not in {".cmd", ".bat"}:
+        return [resolved, *args]
+    wrapper = os.path.basename(resolved).lower()
+    if wrapper not in {"npm.cmd", "npx.cmd"}:
+        raise RuntimeError("stdio 不通过命令解释器启动 .cmd/.bat；请使用 node.exe、python.exe 或服务的 .exe")
+    wrapper_dir = os.path.dirname(os.path.abspath(resolved))
+    node = os.path.join(wrapper_dir, "node.exe")
+    if not os.path.isfile(node):
+        node = shutil.which("node.exe", path=search_path)
+    entry_name = "npx-cli.js" if wrapper == "npx.cmd" else "npm-cli.js"
+    candidates = [os.path.join(wrapper_dir, "node_modules", "npm", "bin", entry_name)]
+    if node:
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(node)), "node_modules", "npm", "bin", entry_name))
+    entry = next((path for path in candidates if os.path.isfile(path)), None)
+    if not node or not os.path.isfile(node) or not entry:
+        raise RuntimeError("无法解析已安装的 npm/npx 入口；请将可执行程序设为 node.exe 的完整路径，并在参数中填写已安装的 npm-cli.js 或 npx-cli.js 路径")
+    return [node, entry, *args]
+
+
+class _WindowsProcessJob:
+    """A kill-on-close Windows Job keeps descendants owned after parent exit."""
+    def __init__(self, process):
+        import ctypes
+        from ctypes import wintypes
+
+        class BasicLimits(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_uint64) for name in ("ReadOperationCount", "WriteOperationCount", "OtherOperationCount", "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", BasicLimits), ("IoInfo", IoCounters),
+                        ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        self.kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        self.kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        self.kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        self.kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.handle = self.kernel.CreateJobObjectW(None, None)
+        limits = ExtendedLimits()
+        limits.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not self.handle or not self.kernel.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            self.close()
+            raise RuntimeError("无法建立 stdio 子进程隔离作业")
+        if not self.kernel.AssignProcessToJobObject(self.handle, wintypes.HANDLE(int(process._handle))):
+            self.close()
+            raise RuntimeError("无法将 stdio 子进程纳入可清理的进程树")
+
+    def close(self):
+        if self.handle:
+            self.kernel.CloseHandle(self.handle)
+            self.handle = None
+
+
+def attach_windows_process_tree(process):
+    """Attach a Popen to kill-on-close ownership; fail closed on Windows.
+
+    Returns None on other platforms, where callers must create and clean their
+    own process group. The returned Windows owner's close() is idempotent.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        return _WindowsProcessJob(process)
+    except BaseException:
+        if process.poll() is None:
+            try:
+                subprocess.run(
+                    [os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe"), "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW, timeout=5, check=False,
+                )
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+        raise
+
+
+class _StdioSession:
+    """Newline JSON-RPC using blocking pipes off the event loop.
+
+    This also works with Windows Selector loops, which do not implement asyncio
+    subprocess transports. Request cancellation closes the whole owned process
+    tree so no pipe reader or unapproved background server remains running.
+    """
+    def __init__(self, server):
+        self.server = server
+        self.process = None
+        self._job = None
+        self._id = 0
+        self._lock = asyncio.Lock()
+        self._stderr_thread = None
+        self.stderr_tail = bytearray()
+        self._closed = False
+
+    def _spawn(self):
+        if not getattr(self.server, "stdio_authorized", False):
+            raise RuntimeError("stdio 服务尚未经 root 授权，不能启动本地进程")
+        command = str(getattr(self.server, "command", "") or "")
+        args = _json_field(getattr(self.server, "args", "[]"), list, [])
+        env = _json_field(getattr(self.server, "env", "{}"), dict, {})
+        cwd = str(getattr(self.server, "cwd", "") or "")
+        validate_stdio_config(command, args, env, cwd)
+        child_env = stdio_environment(env)
+        args = [_expand_env(value) for value in args]
+        argv = resolve_stdio_argv(command, args, child_env)
+        if cwd and not os.path.isdir(cwd):
+            raise RuntimeError("stdio 工作目录不存在")
+        options = {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+        try:
+            self.process = subprocess.Popen(
+                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env=child_env, cwd=cwd or None,
+                shell=False, bufsize=-1, **options,
+            )
+            if os.name == "nt":
+                self._job = attach_windows_process_tree(self.process)
+        except BaseException:
+            self._close_blocking()
+            raise
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True, name="mcp-stderr")
+        self._stderr_thread.start()
+
+    def _drain_stderr(self):
+        try:
+            while True:
+                chunk = self.process.stderr.read(1024)
+                if not chunk:
+                    return
+                self.stderr_tail.extend(chunk)
+                if len(self.stderr_tail) > _STDIO_STDERR_LIMIT:
+                    del self.stderr_tail[:-_STDIO_STDERR_LIMIT]
+        except (OSError, ValueError):
+            pass
+
+    def _write(self, body):
+        wire = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+        if len(wire) > _STDIO_MAX_MESSAGE:
+            raise RuntimeError("MCP stdio 请求超过消息大小上限")
+        self.process.stdin.write(wire)
+        self.process.stdin.flush()
+
+    def _exchange(self, body, expect):
+        try:
+            self._write(body)
+            if not expect:
+                return {}
+            while True:
+                raw = self.process.stdout.readline(_STDIO_MAX_MESSAGE + 1)
+                if not raw:
+                    raise RuntimeError("MCP stdio 服务已退出或关闭输出")
+                if len(raw) > _STDIO_MAX_MESSAGE or not raw.endswith(b"\n"):
+                    raise RuntimeError("MCP stdio 响应超过上限或缺少换行分隔")
+                try:
+                    item = json.loads(raw.decode("utf-8"))
+                except (ValueError, UnicodeError) as exc:
+                    raise RuntimeError("MCP stdio 标准输出包含无效 JSON-RPC；日志应写入 stderr") from exc
+                if not isinstance(item, dict) or item.get("jsonrpc") != "2.0":
+                    raise RuntimeError("MCP stdio 收到无效 JSON-RPC 消息")
+                if "method" in item:
+                    if "id" in item:
+                        reply = {"jsonrpc": "2.0", "id": item["id"]}
+                        if item["method"] == "ping":
+                            reply["result"] = {}
+                        else:
+                            reply["error"] = {"code": -32601, "message": "Client capability not supported"}
+                        self._write(reply)
+                    continue
+                if item.get("id") != body.get("id"):
+                    continue
+                if "error" in item:
+                    # A server can echo credentials in errors; do not propagate it.
+                    raise RuntimeError("MCP stdio 服务返回 JSON-RPC 错误")
+                result = item.get("result")
+                if not isinstance(result, dict):
+                    raise RuntimeError("MCP stdio 返回的 result 必须是对象")
+                return result
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            raise RuntimeError("MCP stdio 管道连接已关闭") from exc
+
+    async def _request(self, method, params, expect=True):
+        async with self._lock:
+            if self._closed or self.process is None:
+                raise RuntimeError("MCP stdio 连接已关闭")
+            body = {"jsonrpc": "2.0", "method": method, "params": params}
+            if expect:
+                self._id += 1
+                body["id"] = self._id
+            try:
+                return await asyncio.wait_for(asyncio.to_thread(self._exchange, body, expect), MCP_TIMEOUT)
+            except BaseException as exc:
+                await self.aclose(graceful=False)
+                if isinstance(exc, asyncio.TimeoutError):
+                    raise RuntimeError("MCP stdio 请求超时，已终止该服务进程树") from exc
+                raise
+
+    async def initialize(self):
+        # Popen is quick and synchronous so cancellation cannot orphan a process
+        # spawned after a cancelled to_thread call has returned to its caller.
+        self._spawn()
+        result = await self._request("initialize", {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": _CLIENT_INFO})
+        if result.get("protocolVersion") not in {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}:
+            await self.aclose()
+            raise RuntimeError("MCP stdio 服务返回不支持的协议版本")
+        await self._request("notifications/initialized", {}, expect=False)
+        return result
+
+    async def list_tools(self):
+        tools, cursor, seen = [], None, set()
+        for _ in range(100):
+            result = await self._request("tools/list", {"cursor": cursor} if cursor else {})
+            page = result.get("tools", [])
+            if not isinstance(page, list) or any(not isinstance(tool, dict) for tool in page):
+                raise RuntimeError("MCP stdio 工具目录格式无效")
+            tools.extend(page)
+            cursor = result.get("nextCursor")
+            if not cursor:
+                return tools
+            if not isinstance(cursor, str) or cursor in seen:
+                raise RuntimeError("MCP stdio 工具目录返回重复或无效游标")
+            seen.add(cursor)
+        raise RuntimeError("MCP stdio 工具目录页数超过上限")
+
+    async def call_tool(self, name, arguments):
+        return await self._request("tools/call", {"name": name, "arguments": arguments or {}})
+
+    def _close_blocking(self, graceful=False):
+        process = self.process
+        if process is None:
+            return
+        if graceful and not self._lock.locked() and process.poll() is None:
+            try:
+                process.stdin.close()
+                process.wait(timeout=0.3)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                pass
+        # Closing the owned job/process group kills descendants even if the MCP
+        # parent has already exited. Never target unrelated host processes.
+        if self._job is not None:
+            self._job.close()
+            self._job = None
+        elif os.name == "nt" and process.poll() is None:
+            subprocess.run([os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe"), "/PID", str(process.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5, check=False)
+        elif os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if process.poll() is None:
+            process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+        if self._stderr_thread and self._stderr_thread is not threading.current_thread():
+            self._stderr_thread.join(timeout=1)
+
+    async def aclose(self, graceful=True):
+        if self._closed:
+            return
+        self._closed = True
+        cleanup = asyncio.create_task(asyncio.to_thread(self._close_blocking, graceful))
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await cleanup
+            raise
 
 
 # ---------- Streamable HTTP 传输 ----------
@@ -407,6 +758,9 @@ class _SseSession:
 
 async def list_tools(server) -> list[dict]:
     """列出某 MCP 服务的工具（连通性测试也用它）。返回 MCP 原始 tool 定义数组。"""
+    if server.transport == "stdio":
+        async with McpConnection(server) as connection:
+            return await connection.list_tools()
     url, headers = resolve_endpoint(server)
     await asyncio.to_thread(validate_outbound_url, url)
     async with _safe_client() as client:
@@ -421,6 +775,9 @@ async def list_tools(server) -> list[dict]:
 
 async def call_tool(server, name: str, arguments: dict) -> str:
     """调用 MCP 工具，返回压平后的文本结果。"""
+    if server.transport == "stdio":
+        async with McpConnection(server) as connection:
+            return await connection.call_tool(name, arguments)
     url, headers = resolve_endpoint(server)
     await asyncio.to_thread(validate_outbound_url, url)
     async with _safe_client() as client:
@@ -443,8 +800,18 @@ class McpConnection:
         self._client: Optional[httpx.AsyncClient] = None
         self._session = None
         self._sse = False
+        self._stdio = False
 
     async def __aenter__(self) -> "McpConnection":
+        if self.server.transport == "stdio":
+            self._stdio = True
+            self._session = _StdioSession(self.server)
+            try:
+                await self._session.initialize()
+            except BaseException:
+                await self.aclose()
+                raise
+            return self
         url, headers = resolve_endpoint(self.server)
         await asyncio.to_thread(validate_outbound_url, url)
         self._client = _safe_client()
@@ -457,7 +824,7 @@ class McpConnection:
             else:
                 self._session = _HttpSession(url, headers)
                 await self._session.initialize(self._client)
-        except Exception:
+        except BaseException:
             await self.aclose()
             raise
         return self
@@ -466,6 +833,8 @@ class McpConnection:
         await self.aclose()
 
     async def aclose(self) -> None:
+        if self._stdio and self._session is not None:
+            await self._session.aclose()
         if self._sse and self._session is not None:
             try:
                 await self._session.__aexit__(None, None, None)
@@ -479,14 +848,18 @@ class McpConnection:
         self._client = None
 
     async def list_tools(self) -> list[dict]:
-        if self._sse:
+        if self._sse or self._stdio:
             return await self._session.list_tools()
         return await self._session.list_tools(self._client)
 
     async def call_tool(self, name: str, arguments: dict) -> str:
-        if self._sse:
-            return flatten_tool_result(await self._session.call_tool(name, arguments))
-        return flatten_tool_result(await self._session.call_tool(self._client, name, arguments))
+        return flatten_tool_result(await self.call_tool_result(name, arguments))
+
+    async def call_tool_result(self, name: str, arguments: dict) -> dict:
+        """返回 MCP 原始信封供运行时判断 isError 和 structuredContent。"""
+        if self._sse or self._stdio:
+            return await self._session.call_tool(name, arguments)
+        return await self._session.call_tool(self._client, name, arguments)
 
 
 # OpenAI / 兼容接口对 function 名的约束：^[a-zA-Z0-9_-]{1,64}$。
@@ -530,6 +903,7 @@ def build_tool_specs(
             "_orig_name": name,
             "_risk": tool_risk_metadata(tool, risk_policy=risk_policy),
             "_input_schema": tool.get("inputSchema") or {"type": "object", "properties": {}},
+            "_output_schema": tool.get("outputSchema"),
             "function": {
                 "name": func_name,
                 "description": (tool.get("description") or name)[:1024],

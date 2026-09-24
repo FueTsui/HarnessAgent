@@ -23,13 +23,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import exists, func, or_, select
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 
 from .config import UPLOAD_DIR, settings
 from .database import SessionLocal
-from .models import Attachment, Item, Job, JobGuidance, Turn, WorkerHeartbeat
+from .models import Attachment, Item, Job, JobGuidance, Turn, User, WorkerHeartbeat
 from .runtime import task_store
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,10 @@ GUIDANCE_PENDING, GUIDANCE_CLAIMED, GUIDANCE_APPLIED, GUIDANCE_CANCELLED, GUIDAN
 
 class JobQuotaExceeded(RuntimeError):
     """队列或用户在途任务超过部署方配置的硬上限。"""
+
+
+class JobOwnerUnavailable(RuntimeError):
+    """已通过认证的请求在入队前失去了有效账户。"""
 
 
 def _now():
@@ -249,6 +253,18 @@ def _append_event_in_session(
     return task_store.append_runtime_item(db, job_id, event_type, payload)
 
 
+def owner_identity(user: User) -> tuple[str, str, int] | None:
+    """Freeze account identity across sessions without carrying credentials."""
+    username = getattr(user, "username", None)
+    created_at = getattr(user, "created_at", None)
+    token_version = getattr(user, "token_version", None)
+    if not isinstance(username, str) or not isinstance(created_at, datetime.datetime) or not isinstance(token_version, int):
+        return None
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+    return username, created_at.astimezone(datetime.timezone.utc).isoformat(), token_version
+
+
 def enqueue_in_session(
     db,
     owner_id: Optional[int],
@@ -257,7 +273,33 @@ def enqueue_in_session(
     payload: dict,
     *,
     idempotency_key: str | None = None,
+    expected_owner_identity: tuple[str, str, int] | None = None,
 ) -> str:
+    if owner_id is not None:
+        cached_owner = db.identity_map.get(db.identity_key(User, owner_id))
+        # Do not refresh expired attributes while capturing authentication proof:
+        # that would replace the old account identity before we can compare it.
+        expected_identity = expected_owner_identity
+        if (expected_identity is None and isinstance(cached_owner, User)
+                and {"username", "created_at", "token_version"} <= cached_owner.__dict__.keys()):
+            expected_identity = owner_identity(cached_owner)
+        # Job.owner_id has no FK. Serialize with account cleanup before any
+        # idempotency shortcut or insert, then bypass a cached authenticated User.
+        # SQLite ignores FOR UPDATE, so a no-op write takes its transaction lock.
+        with db.no_autoflush:
+            if db.get_bind().dialect.name == "sqlite":
+                db.execute(
+                    update(User).where(User.id == owner_id).values(
+                        token_version=User.token_version
+                    ).execution_options(synchronize_session=False)
+                )
+            owner = db.execute(
+                select(User).where(User.id == owner_id).with_for_update()
+                .execution_options(populate_existing=True)
+            ).scalar_one_or_none()
+            if (owner is None or not owner.is_active or owner.role == "guest"
+                    or (expected_identity is not None and owner_identity(owner) != expected_identity)):
+                raise JobOwnerUnavailable("任务所属账号不存在或已禁用，请重新登录")
     key = (idempotency_key or "").strip()[:128] or None
     if key:
         existing = db.query(Job.id).filter(
@@ -374,6 +416,7 @@ def enqueue(
     payload: dict,
     *,
     idempotency_key: str | None = None,
+    expected_owner_identity: tuple[str, str, int] | None = None,
 ) -> str:
     """登记 pending 任务；相同 owner+幂等键始终返回同一任务。"""
     db = SessionLocal()
@@ -386,6 +429,7 @@ def enqueue(
                 kind,
                 payload,
                 idempotency_key=idempotency_key,
+                expected_owner_identity=expected_owner_identity,
             )
             db.commit()
             return job_id
@@ -442,6 +486,7 @@ def _payload_with_query(
     payload.pop("_approval_description", None)
     payload.pop("_approval_agent_id", None)
     payload.pop("_approval_execution_context", None)
+    payload.pop("_approval_binding", None)
     payload["approval_tokens"] = []
     if session_id is not None:
         payload["session_id"] = session_id
@@ -1028,6 +1073,8 @@ def _queued_plain_text(job: Job) -> tuple[str, dict]:
         payload = json.loads(job.payload or "{}")
     except json.JSONDecodeError:
         payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
     input_values = payload.get("inputs") if isinstance(payload.get("inputs"), dict) else {}
     structured = any(payload.get(key) for key in (
         "attachment_images", "attachment_docs", "dataset_ids", "template_ids",
@@ -1039,6 +1086,89 @@ def _queued_plain_text(job: Job) -> tuple[str, dict]:
     if not content:
         raise ValueError("排队消息不能为空")
     return content, payload
+
+
+_GUIDANCE_SETTINGS_CONFLICT = (
+    "该消息与当前任务的模型、推理强度、审批或智能体设置不同或无法确认，请保留为排队任务"
+)
+
+
+def _guidance_execution_settings(job: Job, payload: dict) -> tuple[dict, dict]:
+    """Require frozen evidence; missing legacy choices are not assumed defaults.
+
+    Older payloads may omit composer choices, but a complete execution snapshot
+    can still prove their effective settings. Never consult current Agent/model
+    records: those may have changed since either Turn was queued.
+    """
+    from .reasoning_options import EFFORT_ORDER
+    snapshot = payload.get("execution_snapshot")
+    if not isinstance(snapshot, dict):
+        raise RuntimeError(_GUIDANCE_SETTINGS_CONFLICT)
+    agent, harness, provider = (snapshot.get(key) for key in ("agent", "harness", "provider"))
+    if (
+        type(job.agent_id) is not int or job.agent_id <= 0
+        or not isinstance(agent, dict) or type(agent.get("id")) is not int
+        or agent["id"] != job.agent_id
+        or not isinstance(harness, dict) or type(harness.get("version")) is not int
+        or harness["version"] <= 0
+        or not isinstance(provider, dict) or not isinstance(provider.get("model_id"), str)
+        or not provider["model_id"].strip()
+        or "id" not in provider or type(provider.get("model_reasoning")) is not bool
+        or (provider["id"] is None and provider.get("is_environment_default") is not True)
+        or (provider["id"] is not None and (type(provider["id"]) is not int or provider["id"] <= 0))
+        or (provider["model_reasoning"] and not isinstance(provider.get("reasoning_effort"), str))
+    ):
+        raise RuntimeError(_GUIDANCE_SETTINGS_CONFLICT)
+    for values, key, expected in (
+        (payload, "agent_id", job.agent_id),
+        (harness, "agent_id", job.agent_id),
+        (payload, "harness_version", harness["version"]),
+    ):
+        if key in values and (type(values[key]) is not int or values[key] != expected):
+            raise RuntimeError(_GUIDANCE_SETTINGS_CONFLICT)
+
+    policies = [values["approval_policy"] for values in (payload, snapshot) if "approval_policy" in values]
+    if not policies or any(value not in ("ask", "auto", "full_access") or value != policies[0] for value in policies):
+        raise RuntimeError(_GUIDANCE_SETTINGS_CONFLICT)
+
+    choices = {}
+    if "provider_id" in payload:
+        provider_id = payload["provider_id"]
+        if provider_id is not None and (type(provider_id) is not int or provider_id <= 0 or provider_id != provider["id"]):
+            raise RuntimeError(_GUIDANCE_SETTINGS_CONFLICT)
+        choices["provider_id"] = provider_id
+    efforts = [values["reasoning_effort"] for values in (payload, snapshot) if "reasoning_effort" in values]
+    if efforts:
+        if any(not isinstance(value, str) or value not in ("", *EFFORT_ORDER)
+               or value != efforts[0] for value in efforts):
+            raise RuntimeError(_GUIDANCE_SETTINGS_CONFLICT)
+        choices["reasoning_effort"] = efforts[0]
+        if efforts[0] and (not provider["model_reasoning"] or provider.get("reasoning_effort") != efforts[0]):
+            raise RuntimeError(_GUIDANCE_SETTINGS_CONFLICT)
+
+    # Route health/reasons are diagnostics, not execution settings. The primary,
+    # ordered fallbacks, role models, Harness and capability snapshots remain in
+    # this comparison, including unrecognised extensions (fail closed).
+    effective = {key: value for key, value in snapshot.items()
+                 if key not in {"provider_route", "reasoning_effort", "approval_policy"}}
+    effective["approval_policy"] = policies[0]
+    return choices, effective
+
+
+def _require_same_guidance_settings(source: Job, target: Job, source_payload: dict) -> None:
+    try:
+        target_payload = json.loads(target.payload or "{}")
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(_GUIDANCE_SETTINGS_CONFLICT) from exc
+    if not isinstance(target_payload, dict):
+        raise RuntimeError(_GUIDANCE_SETTINGS_CONFLICT)
+    source_choices, source_effective = _guidance_execution_settings(source, source_payload)
+    target_choices, target_effective = _guidance_execution_settings(target, target_payload)
+    if source_effective != target_effective or any(
+        source_choices[key] != target_choices[key]
+        for key in source_choices.keys() & target_choices.keys()
+    ):
+        raise RuntimeError(_GUIDANCE_SETTINGS_CONFLICT)
 
 
 def convert_queued_message_to_guidance(
@@ -1058,9 +1188,10 @@ def convert_queued_message_to_guidance(
         if target is None or target.owner_id != owner_id or target.kind != "chat":
             raise LookupError("目标任务不存在")
         try:
-            content, _ = _queued_plain_text(source)
+            content, source_payload = _queued_plain_text(source)
         except RuntimeError as exc:
             raise RuntimeError("该消息包含附件或能力上下文，不能改为纯文本引导") from exc
+        _require_same_guidance_settings(source, target, source_payload)
         # 对目标行做条件空更新以建立与终态转换之间的事务顺序。
         target_open = db.query(Job).filter(
             Job.id == target_job_id,
@@ -1496,6 +1627,7 @@ def wait_for_approval(
     *,
     approval_agent_id: int | None = None,
     execution_context: dict | None = None,
+    binding: dict | None = None,
 ) -> bool:
     """仅当前租约持有者可把任务暂停为待用户批准。"""
     event_meta = {}
@@ -1514,6 +1646,8 @@ def wait_for_approval(
         payload["_approval_description"] = description
         payload["_approval_agent_id"] = approval_agent_id
         payload["_approval_execution_context"] = dict(execution_context or {})
+        from .approvals import normalize_binding
+        payload["_approval_binding"] = normalize_binding(binding)
         job.payload = json.dumps(payload, ensure_ascii=False)
         job.status = AWAITING_APPROVAL
         turn = db.get(Turn, job_id)
@@ -1572,7 +1706,7 @@ def approve_waiting(job_id: str, owner_id: int) -> bool:
         approval_agent_id = payload.get("_approval_agent_id")
         if approval_agent_id is None:
             approval_agent_id = job.agent_id
-        token = issue(job.id, owner_id, approval_agent_id, scope)
+        token = issue(job.id, owner_id, approval_agent_id, scope, binding=payload.get("_approval_binding"))
         tokens = payload.get("approval_tokens")
         if not isinstance(tokens, list):
             tokens = []
@@ -1582,6 +1716,7 @@ def approve_waiting(job_id: str, owner_id: int) -> bool:
         payload.pop("_approval_description", None)
         execution_context = payload.pop("_approval_execution_context", {})
         payload.pop("_approval_agent_id", None)
+        payload.pop("_approval_binding", None)
         job.payload = json.dumps(payload, ensure_ascii=False)
         job.status = PENDING
         turn = db.get(Turn, job_id)

@@ -40,9 +40,11 @@ from ..approval_policy import (
     ASK as DEFAULT_APPROVAL_POLICY,
     builtin_risk,
     normalize as normalize_approval_policy,
-    requires_builtin_approval,
 )
 from ..net_guard import validate_outbound_url
+from .. import guardrails
+from ..guardrail_policies import enforce_content, ContentBlocked
+from .presentation_requirements import PresentationRequirements
 
 
 class ToolError(RuntimeError):
@@ -104,6 +106,8 @@ class BuiltinToolContext:
     execution_id: str | None = None
     parent_run_id: str | None = None
     artifacts: list[str] = field(default_factory=list)
+    # Trusted API callback persists completed files before later plan/model failure.
+    artifact_callback: Callable[[str], Awaitable[None]] | None = None
     attachment_images: list[Path] = field(default_factory=list)
     required_artifact_kinds: set[str] = field(default_factory=set)
     active_skill_names: set[str] = field(default_factory=set)
@@ -113,6 +117,8 @@ class BuiltinToolContext:
     plan_steps: list[dict] = field(default_factory=list)
     plan_revision: int = 0
     deferred_artifact_kinds: set[str] = field(default_factory=set)
+    # 由已授权附件与用户目标确定；模型工具参数不得覆盖来源页数或语言要求。
+    presentation_requirements: PresentationRequirements | None = None
     # None 仅用于测试/内部直接调用，表示使用全部工具；真实 Chat Turn 总是传入
     # Root 配置与 Agent 绑定计算后的显式集合。
     enabled_tools: set[str] | None = None
@@ -1304,6 +1310,18 @@ async def _document_inspect(args: dict, ctx: BuiltinToolContext):
     )
 
 
+async def _presentation_create(args: dict, ctx: BuiltinToolContext):
+    _confirmed(args, "创建 PowerPoint 演示文稿")
+    from ..capabilities.presentations import create_presentation
+    try:
+        result = await asyncio.to_thread(
+            create_presentation, args, EXPORT_DIR, requirements=ctx.presentation_requirements,
+        )
+    except (ValueError, ImportError) as exc:
+        raise ToolError(str(exc)) from exc
+    return json.dumps(result, ensure_ascii=False)
+
+
 async def _document_create(args: dict, ctx: BuiltinToolContext):
     """从模型已经核验的文字和表格数据创建一个可下载的 DOCX。"""
     _confirmed(args, "创建 Word 文档")
@@ -2397,7 +2415,39 @@ def _specs() -> list[BuiltinTool]:
     ]
 
 
+async def _service_list(args, ctx):
+    from ..custom_services import service_definitions
+    owner_id, agent_id = _require_identity(ctx)
+    return _json_result(services=await asyncio.to_thread(service_definitions, owner_id, agent_id))
+
+
+async def _service_call(args, ctx):
+    from ..custom_services import execute_service
+    owner_id, agent_id = _require_identity(ctx)
+    if args.get("confirm") is not True:
+        raise ToolError("运行服务需要 confirm=true")
+    return _json_result(result=await execute_service(
+        int(args["service_id"]), args.get("input", {}), owner_id, agent_id,
+        run_id=ctx.run_id, approval_policy=ctx.approval_policy,
+        approval_tokens=ctx.approval_tokens, runtime_event=ctx.runtime_event,
+        provider_id=getattr(ctx.llm, "provider_id", None),
+    ))
+
+
 TOOLS: dict[str, BuiltinTool] = {item.name: item for item in _specs()}
+TOOLS["presentation_create"] = BuiltinTool(
+    "presentation_create", "将逐页标题与正文导出为原生文字可编辑 PPTX；无需 Shell。不复刻源图片或复杂版式。",
+    _object({"title": {"type": "string"}, "output_name": {"type": "string"},
+             "slides": {"type": "array", "minItems": 1, "maxItems": 80, "items": _object({
+                 "title": {"type": "string", "maxLength": 48},
+                 "body": {"type": "string", "maxLength": 480, "description": "最多10行，过长必须拆页"},
+                 "source_pages": {"type": "array", "items": {"type": "integer", "minimum": 1},
+                                  "description": "逐页重制时每页仅填写对应来源页号，例如第3页为[3]；须覆盖服务端指定的全部来源页"},
+             }, ["title", "body"])}, "confirm": {"type": "boolean"}}, ["slides", "confirm"]),
+    _presentation_create, "document", True,
+)
+TOOLS["service_list"] = BuiltinTool("service_list", "列出当前用户与智能体获准调用的自定义网络、编程服务和输入字段。", _object({}), _service_list, "services")
+TOOLS["service_call"] = BuiltinTool("service_call", "按 service_list 返回的服务ID与字段运行已分配服务；可能修改外部数据，需批准。", _object({"service_id":{"type":"integer"},"input":{"type":"object"},"confirm":{"type":"boolean"}},["service_id","input","confirm"]), _service_call, "services", True)
 
 # 公共智能体面对所有普通用户，不能继承创建者/服务账号对本机工作区的权限。
 # 即使旧数据库仍绑定这些工具，运行时也会强制剔除，避免配置漂移重新打开攻击面。
@@ -2434,14 +2484,38 @@ async def execute(name: str, args: dict, ctx: BuiltinToolContext) -> str:
     if ctx.enabled_tools is not None and name not in ctx.enabled_tools:
         return _json_result(ok=False, error=f"内置工具未授权：{name}", tool=name)
     try:
+        await enforce_content(
+            "tool_input", args, user_id=ctx.user_id, agent_id=ctx.agent_id,
+            provider_id=getattr(ctx.llm, "provider_id", None), runtime_event=ctx.runtime_event,
+        )
+        decision = await asyncio.to_thread(
+            guardrails.runtime_decision,
+            kind="builtin", tool_name=name, arguments=args,
+            policy=ctx.approval_policy, mutating=tool.mutating,
+        )
+        if decision["decision"] == "block" or decision["guardrail_requires_approval"]:
+            if ctx.runtime_event:
+                event_value = ctx.runtime_event("guardrail.evaluated", guardrails.event_payload(
+                    decision, agent_id=ctx.agent_id, execution_id=ctx.execution_id or ctx.run_id,
+                ))
+                if asyncio.iscoroutine(event_value):
+                    await event_value
+        from ..guardrail_reviews import review_tool
+        decision = await review_tool(decision, ctx.user_id, ctx.agent_id, ctx.runtime_event)
+        if decision["decision"] == "block":
+            raise ToolError(decision["reason"], code="guardrail_blocked")
+        if decision["guardrail_requires_approval"] and not ctx.run_id:
+            raise ToolError("护栏要求单次审批，当前调用缺少可审批任务上下文", code="guardrail_approval_context_required")
         if name in {"image_generate", "image_render"}:
             ctx.required_artifact_kinds.add("image")
         if name in {"document_create", "document_format"}:
             ctx.required_artifact_kinds.add("document")
+        if name == "presentation_create":
+            ctx.required_artifact_kinds.add("presentation")
         # 能力缺失应在申请批准之前暴露，避免用户批准后整个 Agent Loop 重跑才失败。
         if name == "image_generate":
             _image_preflight(ctx)
-        if tool.mutating and ctx.run_id:
+        if tool.mutating and ctx.run_id and name != "service_call":
             selected_policy = normalize_approval_policy(ctx.approval_policy)
             risk = builtin_risk(name, args)
             approved_once = consume_approval(
@@ -2451,12 +2525,7 @@ async def execute(name: str, args: dict, ctx: BuiltinToolContext) -> str:
                 agent_id=ctx.agent_id,
                 scope=name,
             )
-            if not approved_once and requires_builtin_approval(
-                selected_policy,
-                tool_name=name,
-                mutating=True,
-                arguments=args,
-            ):
+            if not approved_once and decision["requires_approval"]:
                 raise ApprovalRequired(
                     name,
                     tool.description,
@@ -2486,6 +2555,10 @@ async def execute(name: str, args: dict, ctx: BuiltinToolContext) -> str:
         value = tool.handler(args, ctx)
         if asyncio.iscoroutine(value):
             value = await value
+        await enforce_content(
+            "tool_output", value, user_id=ctx.user_id, agent_id=ctx.agent_id,
+            provider_id=getattr(ctx.llm, "provider_id", None), runtime_event=ctx.runtime_event,
+        )
         artifact_value = None
         if isinstance(value, str):
             try:
@@ -2496,6 +2569,8 @@ async def execute(name: str, args: dict, ctx: BuiltinToolContext) -> str:
             artifact_value = value
         if isinstance(artifact_value, dict) and artifact_value.get("file"):
             filename = Path(str(artifact_value["file"])).name
+            if ctx.artifact_callback:
+                await ctx.artifact_callback(filename)
             if filename not in ctx.artifacts:
                 ctx.artifacts.append(filename)
             if name in {"image_generate", "image_render"}:
@@ -2509,6 +2584,8 @@ async def execute(name: str, args: dict, ctx: BuiltinToolContext) -> str:
         return _json_result(result=value)
     except ApprovalRequired:
         raise
+    except ContentBlocked as exc:
+        return _json_result(ok=False, error=str(exc), code=exc.code, retryable=False, tool=name)
     except ToolError as exc:
         if name in {"image_generate", "image_render"}:
             ctx.artifact_failures["image"] = f"{exc.code}：{exc}"
@@ -2583,6 +2660,22 @@ def completion_artifact_issues(ctx: BuiltinToolContext) -> list[str]:
                 if reason else
                 "缺少任务所需 Word 产物：没有生成可下载且有效的 DOCX Artifact"
             )
+    if "presentation" in ctx.required_artifact_kinds:
+        from ..artifacts import inspect_presentation_artifact
+        from .presentation_requirements import inspect_presentation_requirements
+        valid_presentation = False
+        coverage_issues = []
+        for name in ctx.artifacts:
+            if not name.lower().endswith(".pptx") or not inspect_presentation_artifact(name).get("valid"):
+                continue
+            report = inspect_presentation_requirements(name, ctx.presentation_requirements, EXPORT_DIR)
+            if report["valid"]:
+                valid_presentation = True
+                break
+            coverage_issues.extend(report["issues"])
+        if not valid_presentation:
+            issues.append("缺少任务所需 PPT 产物：没有生成可下载且逐页有效的 PPTX Artifact")
+            issues.extend(coverage_issues[:12])
     return issues
 
 

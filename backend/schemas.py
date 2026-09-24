@@ -86,8 +86,13 @@ class UserOut(BaseModel):
     username: str
     role: str
     is_active: bool
+    is_guest: bool = False
     all_modules: bool = False      # 是否拥有当前角色可授予的全部模块
     modules: list[str] = []        # 当非全部时，具体可访问模块
+
+
+class LoginResponse(UserOut):
+    """Browser login exposes identity only; its credential is an HttpOnly cookie."""
 
 
 class UserTokenLimitsUpdate(BaseModel):
@@ -122,7 +127,8 @@ class ProviderCreate(BaseModel):
     custom_headers: dict = Field(default_factory=dict)
     extra_body: dict = Field(default_factory=dict)
     model_list_path: str = Field(default="/models", max_length=128)
-    reasoning_effort: str = Field(default="", pattern="^(|minimal|low|medium|high|xhigh|max)$")
+    reasoning_effort: str = Field(default="", pattern="^(|none|minimal|low|medium|high|xhigh|max|disabled|enabled)$")
+    reasoning_config: dict = Field(default_factory=dict)
     max_tokens: int = Field(default=8192, ge=1, le=1_000_000)
     max_tokens_param: str = Field(
         default="auto",
@@ -167,7 +173,8 @@ class ProviderUpdate(BaseModel):
     custom_headers: Optional[dict] = None
     extra_body: Optional[dict] = None
     model_list_path: Optional[str] = Field(default=None, max_length=128)
-    reasoning_effort: Optional[str] = Field(default=None, pattern="^(|minimal|low|medium|high|xhigh|max)$")
+    reasoning_effort: Optional[str] = Field(default=None, pattern="^(|none|minimal|low|medium|high|xhigh|max|disabled|enabled)$")
+    reasoning_config: Optional[dict] = None
     max_tokens: Optional[int] = Field(default=None, ge=1, le=1_000_000)
     max_tokens_param: Optional[str] = Field(
         default=None,
@@ -218,6 +225,12 @@ class ProviderOut(BaseModel):
     extra_body: dict = Field(default_factory=dict)
     model_list_path: str = "/models"
     reasoning_effort: str = ""
+    reasoning_config: dict = Field(default_factory=dict)
+    reasoning_efforts: list[str] = Field(default_factory=list)
+    reasoning_supported: bool = False
+    reasoning_unavailable_reason: str = ""
+    reasoning_control: str = "effort"
+    reasoning_effort_labels: dict[str, str] = Field(default_factory=dict)
     max_tokens: int = 8192
     max_tokens_param: str = "auto"
     timeout_ms: int = 120000
@@ -293,9 +306,13 @@ class AgentOut(BaseModel):
 class McpServerCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     description: str = ""
-    transport: str = Field(default="http", pattern="^(http|sse)$")
-    url: str = Field(min_length=1, max_length=1024)
+    transport: str = Field(default="http", pattern="^(http|sse|stdio)$")
+    url: str = Field(default="", max_length=1024)
     headers: dict = Field(default_factory=dict)
+    command: str = Field(default="", max_length=4096)
+    args: list[str] = Field(default_factory=list, max_length=100)
+    env: dict[str, str] = Field(default_factory=dict, max_length=100)
+    cwd: str = Field(default="", max_length=4096)
     risk_policy: str = Field(default="auto", pattern="^(auto|read_only)$")
     enabled: bool = True
 
@@ -303,9 +320,13 @@ class McpServerCreate(BaseModel):
 class McpServerUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
-    transport: Optional[str] = Field(default=None, pattern="^(http|sse)$")
+    transport: Optional[str] = Field(default=None, pattern="^(http|sse|stdio)$")
     url: Optional[str] = None
     headers: Optional[dict] = None
+    command: Optional[str] = Field(default=None, max_length=4096)
+    args: Optional[list[str]] = Field(default=None, max_length=100)
+    env: Optional[dict[str, str]] = Field(default=None, max_length=100)
+    cwd: Optional[str] = Field(default=None, max_length=4096)
     risk_policy: Optional[str] = Field(default=None, pattern="^(auto|read_only)$")
     enabled: Optional[bool] = None
     is_public: Optional[bool] = None
@@ -318,6 +339,11 @@ class McpServerOut(BaseModel):
     transport: str
     url: str
     headers: dict = {}
+    command: str = ""
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    cwd: str = ""
+    stdio_authorized: bool = False
     risk_policy: str = "auto"
     enabled: bool
     is_public: bool = False

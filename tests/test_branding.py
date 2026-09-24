@@ -19,6 +19,17 @@ class _FakeDb:
 
 
 class BrandingTests(unittest.TestCase):
+    def setUp(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        branding_dir = Path(directory.name)
+        (branding_dir / "favicon.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>', encoding="utf-8"
+        )
+        patcher = patch.object(settings, "BRANDING_DIR", branding_dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_frontend_shell_is_rendered_with_current_brand_before_first_paint(self):
         template = (
             "<title>__BRAND_DOCUMENT_TITLE__</title>"

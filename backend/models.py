@@ -11,6 +11,7 @@ from .secret_store import EncryptedText
 ROLE_ROOT = "root"
 ROLE_ADMIN = "admin"
 ROLE_USER = "user"
+ROLE_GUEST = "guest"
 ROLES = (ROLE_ROOT, ROLE_ADMIN, ROLE_USER)
 
 # 设置页模块目录：root 可逐个授予 admin / user 访问；root 始终拥有全部。
@@ -18,11 +19,15 @@ ROLES = (ROLE_ROOT, ROLE_ADMIN, ROLE_USER)
 # 在此追加 (key, 标签) 即新增一个可授权模块（数据驱动，前端自动渲染）。
 ADMIN_MODULES = [
     ("agents", "智能体"),
-    ("improvement", "改进实验室"),
-    ("knowledge", "知识库"),
-    ("mcp", "MCP"),
+    ("improvement", "评估与改进"),
+    ("knowledge", "知识"),
+    ("tools", "工具总览（内置工具）"),
+    ("mcp", "工具 · MCP"),
+    ("services", "服务（网络与编程）"),
+    ("memory", "记忆"),
+    ("guardrails", "护栏"),
     ("providers", "模型"),
-    ("skills", "Skills"),
+    ("skills", "工具 · 技能"),
     ("templates", "模板"),
     ("schedules", "定时任务"),
     ("archive", "归档"),
@@ -32,6 +37,7 @@ ADMIN_MODULES = [
 ]
 ADMIN_MODULE_KEYS = {k for k, _ in ADMIN_MODULES}
 USER_MODULE_KEYS = {
+    "tools", "services", "memory", "guardrails",
     "knowledge",
     "mcp",
     "skills",
@@ -70,12 +76,28 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(256))
     role: Mapped[str] = mapped_column(String(16), default=ROLE_USER)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    # JWT 撤销版本；改密、禁用、角色或权限变更时递增，使既有令牌立即失效。
+    # 会话/JWT 撤销版本；改密、禁用、角色或权限变更时递增，使既有凭据立即失效。
     token_version: Mapped[int] = mapped_column(Integer, default=0)
     # 设置页模块授权：admin 空串 = 全部（向后兼容）；user 空串 = 无模块。
     # JSON 数组表示明确授权的模块；对 root 无意义（始终全部）。
     permissions: Mapped[str] = mapped_column(Text, default="")
+    # Account-scoped UI/execution preferences; never grants module or tool access.
+    preferences: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=_now)
+
+
+class AuthSession(Base):
+    """Server-side browser sessions. Only a digest of the cookie is persisted."""
+
+    __tablename__ = "auth_sessions"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    token_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class ModelProvider(Base):
@@ -112,6 +134,7 @@ class ModelProvider(Base):
     extra_body: Mapped[str] = mapped_column(Text, default="{}")
     model_list_path: Mapped[str] = mapped_column(String(128), default="/models")
     reasoning_effort: Mapped[str] = mapped_column(String(16), default="")
+    reasoning_config: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
     max_tokens: Mapped[int] = mapped_column(Integer, default=8192)
     max_tokens_param: Mapped[str] = mapped_column(String(32), default="auto")
     timeout_ms: Mapped[int] = mapped_column(Integer, default=120000)
@@ -215,6 +238,11 @@ class McpServer(Base):
     name: Mapped[str] = mapped_column(String(128), unique=True)
     description: Mapped[str] = mapped_column(Text, default="")
     transport: Mapped[str] = mapped_column(String(16), default="http")
+    command: Mapped[str] = mapped_column(Text, default="", server_default="")
+    args: Mapped[str] = mapped_column(EncryptedText(), default="[]")
+    env: Mapped[str] = mapped_column(EncryptedText(), default="{}")
+    cwd: Mapped[str] = mapped_column(Text, default="", server_default="")
+    stdio_authorized: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     url: Mapped[str] = mapped_column(String(1024), default="")
     headers: Mapped[str] = mapped_column(EncryptedText(), default="{}")
     # auto：优先 annotations，再用保守语义判断；read_only：管理员确认该服务
@@ -615,6 +643,9 @@ class ToolApproval(Base):
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), index=True)
     agent_id: Mapped[int] = mapped_column(Integer, ForeignKey("agents.id"), nullable=True)
     scope: Mapped[str] = mapped_column(String(64))
+    invocation_id: Mapped[str] = mapped_column(String(32), default="", server_default="")
+    arguments_digest: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    capability_revision: Mapped[str] = mapped_column(String(128), default="", server_default="")
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     expires_at: Mapped[datetime.datetime] = mapped_column(DateTime, index=True)
     consumed_at: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=True)
@@ -691,6 +722,44 @@ class Job(Base):
     event_sequence: Mapped[int] = mapped_column(Integer, default=0)
     heartbeat_at: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=True)  # 续租心跳
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=_now, index=True)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class RuntimeCheckpoint(Base):
+    """Private executable state; never part of the public Item/event projection."""
+
+    __tablename__ = "runtime_checkpoints"
+    __table_args__ = (UniqueConstraint("run_id", "execution_key", name="uq_runtime_checkpoint_execution"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(32), ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
+    owner_id: Mapped[int] = mapped_column(Integer, index=True)
+    execution_key: Mapped[str] = mapped_column(String(160))
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    state: Mapped[str] = mapped_column(EncryptedText(), default="{}")
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class ToolInvocation(Base):
+    """Write-ahead execution ledger with encrypted arguments and observations."""
+
+    __tablename__ = "tool_invocations"
+    __table_args__ = (UniqueConstraint("run_id", "execution_key", "call_id", name="uq_tool_invocation_call"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(32), ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
+    owner_id: Mapped[int] = mapped_column(Integer, index=True)
+    execution_key: Mapped[str] = mapped_column(String(160))
+    call_id: Mapped[str] = mapped_column(String(160))
+    tool_name: Mapped[str] = mapped_column(String(160))
+    arguments_digest: Mapped[str] = mapped_column(String(64))
+    capability_revision: Mapped[str] = mapped_column(String(128))
+    effect: Mapped[str] = mapped_column(String(32), default="unknown")
+    state: Mapped[str] = mapped_column(String(32), default="prepared", index=True)
+    arguments: Mapped[str] = mapped_column(EncryptedText(), default="{}")
+    result: Mapped[str] = mapped_column(EncryptedText(), default="{}")
+    lease_token: Mapped[str] = mapped_column(String(32), default="")
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
 

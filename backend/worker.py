@@ -22,6 +22,7 @@ from . import jobs
 from .approvals import ApprovalRequired
 from .config import settings
 from .runtime.evaluation import evaluation_summary
+from .guest_access import is_guest, reject_guest_resources, validate_guest_execution
 
 logger = logging.getLogger(__name__)
 
@@ -126,15 +127,18 @@ def worker_id() -> str:
 
 
 async def _invoke(view: jobs.JobView) -> dict:
+    from .guardrail_reviews import bind_review_context
     fn = HANDLERS.get(view.kind)
     if fn is None:
         raise RuntimeError(f"未知任务类型：{view.kind}")
     if view.owner_id is None:
         return await fn(view)
     from .token_usage import bind_usage_context
-    with bind_usage_context(
+    from .runtime.durability import bind_execution_lease
+    with bind_review_context(view.id), bind_usage_context(
         view.owner_id, run_id=view.id, agent_id=view.agent_id
-    ):
+    ), bind_execution_lease(view.id, view.owner_id, view.worker_id, view.lease_token,
+                           session_factory=jobs.SessionLocal):
         return await fn(view)
 
 
@@ -166,6 +170,7 @@ async def _supervise(view: jobs.JobView, wid: str) -> None:
                 exc.description,
                 approval_agent_id=exc.agent_id,
                 execution_context=exc.execution_context,
+                binding=exc.binding,
             )
             return
         except Exception as exc:  # noqa: BLE001 - 失败状态对外暴露
@@ -334,12 +339,17 @@ async def _chat_handler(view: jobs.JobView) -> dict:
         if (
             user is None
             or not user.is_active
+            or is_guest(user)
             or agent is None
             or not agent.enabled
             or not (can_access_agent(user, agent) or delegated_access)
         ):
             raise RuntimeError("智能体不存在或已停用")
         execution_snapshot = payload.get("execution_snapshot")
+        if is_guest(user):
+            reject_guest_resources(user, skill_ids=skill_ids, mcp_ids=mcp_ids,
+                                   agent_ids=invoked_agent_ids, template_ids=template_ids, dataset_ids=dataset_ids)
+            validate_guest_execution(db, user, agent, execution_snapshot)
         # 新任务在入队时已完成能力校验并固化完整快照。仅为历史无快照任务保留旧校验。
         if not isinstance(execution_snapshot, dict):
             _validate_invocations(
@@ -449,7 +459,7 @@ async def _chat_handler(view: jobs.JobView) -> dict:
             filenames=export_files,
         )
         db.commit()
-        if is_first_turn and thread is not None:
+        if is_first_turn and thread is not None and not is_guest(user):
             _schedule_conversation_title(
                 str(thread.id), int(agent.id), inputs.query, answer, fallback_title,
             )

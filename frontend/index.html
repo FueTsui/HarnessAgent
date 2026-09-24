@@ -6,6 +6,9 @@
   <title>__BRAND_DOCUMENT_TITLE__</title>
   <link id="brand-favicon" rel="icon" href="__BRAND_LOGO_URL__" />
   <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/chat-workspace.css" />
+  <link rel="stylesheet" href="/static/desktop-ui.css" />
+  <script src="/static/desktop-ui.js" defer></script>
 </head>
 <body class="chat-page is-booting" aria-busy="true">
   <button class="mobile-scrim" id="mobile-scrim" aria-label="关闭侧栏"></button>
@@ -17,10 +20,15 @@
           <span data-icon="panel"></span>
         </button>
       </div>
-      <button class="new-thread" id="new-chat-btn">
+      <button class="new-thread" id="new-chat-btn" title="新对话" aria-label="新对话">
         <span class="nav-icon" data-icon="plus"></span><span>新对话</span>
         <kbd>Ctrl K</kbd>
       </button>
+      <button class="icon-button rail-only" id="sidebar-expand" aria-label="展开侧栏" title="展开侧栏" hidden>
+        <span data-icon="panel"></span>
+      </button>
+      <button class="icon-button rail-only" id="rail-search" aria-label="搜索对话" title="搜索对话"><span data-icon="search"></span></button>
+      <button class="icon-button rail-only" id="rail-projects" aria-label="查看项目" title="查看项目"><span data-icon="folder"></span></button>
       <div class="history-search">
         <span data-icon="search" data-icon-size="16"></span>
         <input id="history-search" placeholder="搜索对话" autocomplete="off" aria-label="搜索对话" />
@@ -55,14 +63,8 @@
             <span class="section-chevron" data-icon="chevronDown" data-icon-size="13"></span>
           </button>
           <span class="section-head-actions recent-section-actions">
-            <button class="sidebar-action-button section-more-button" id="recent-more-btn" title="最近对话显示选项" aria-label="最近对话显示选项" aria-haspopup="menu" aria-expanded="false">•••</button>
             <button class="sidebar-action-button" id="recent-new-chat-btn" title="新建对话" aria-label="新建对话"><span data-icon="edit" data-icon-size="14"></span></button>
           </span>
-          <div class="section-options-menu recent-section-menu" id="recent-section-menu" role="menu" hidden>
-            <div class="section-menu-label">排序方式</div>
-            <button id="recent-sort-priority" class="menu-choice" role="menuitemradio"><span class="menu-check" data-icon="check" data-icon-size="13"></span><span>置顶优先</span></button>
-            <button id="recent-sort-updated" class="menu-choice" role="menuitemradio"><span class="menu-check" data-icon="check" data-icon-size="13"></span><span>最近更新</span></button>
-          </div>
         </div>
         <div class="thread-list" id="history-panel">
           <div class="sidebar-loading" aria-hidden="true">
@@ -71,17 +73,23 @@
         </div>
       </section>
       <div class="sidebar-account">
-        <div class="avatar" id="user-avatar">U</div>
-        <div class="account-copy">
-          <strong id="account-name"></strong>
-          <span id="account-role"></span>
-        </div>
-        <button class="icon-button more-button" id="account-menu-btn" aria-label="账户菜单">•••</button>
-        <div class="account-menu" id="account-menu" role="menu">
-          <a href="/admin" id="admin-link" role="menuitem"><span data-icon="settings"></span>设置</a>
-          <button id="theme-toggle" role="menuitem"><span data-theme-icon></span><span>切换外观</span></button>
-          <button id="change-password-btn" role="menuitem"><span data-icon="key"></span>修改密码</button>
-          <button class="danger-text" id="logout-btn" role="menuitem"><span data-icon="logout"></span>退出登录</button>
+        <button class="account-trigger" id="account-menu-btn" aria-label="账户菜单" aria-haspopup="menu" aria-controls="account-menu" aria-expanded="false">
+          <span class="avatar" id="user-avatar">U</span>
+          <span class="account-copy"><strong id="account-name"></strong><span id="account-role"></span></span>
+          <span class="account-menu-chevron" data-icon="chevronDown" data-icon-size="16"></span>
+        </button>
+        <div class="account-menu" id="account-menu" role="menu" aria-label="账户" hidden>
+          <a href="/admin#preferences" id="admin-link" role="menuitem" hidden><span data-icon="settings"></span>后台管理</a>
+          <a href="/login" id="login-link" role="menuitem" hidden><span data-icon="users"></span>登录账户</a>
+          <button class="danger-text" id="logout-btn" role="menuitem" hidden><span data-icon="logout"></span>退出登录</button>
+          <div class="account-theme">
+            <span class="account-theme-label" id="account-theme-label">外观</span>
+            <div class="account-theme-options" id="account-theme-options" role="group" aria-labelledby="account-theme-label">
+              <button type="button" data-account-theme="light" role="menuitemradio" aria-checked="false"><span data-icon="sun" data-icon-size="15"></span>浅色</button>
+              <button type="button" data-account-theme="dark" role="menuitemradio" aria-checked="false"><span data-icon="moon" data-icon-size="15"></span>深色</button>
+              <button type="button" data-account-theme="system" role="menuitemradio" aria-checked="true" aria-label="跟随系统" title="跟随系统"><span data-icon="panel" data-icon-size="15"></span>系统</button>
+            </div>
+          </div>
         </div>
       </div>
     </aside>
@@ -95,25 +103,19 @@
         </div>
       </div>
       <header class="conversation-header">
-        <button class="icon-button desktop-sidebar-expand" id="sidebar-expand" aria-label="展开侧栏" title="展开侧栏" hidden>
-          <span data-icon="panel"></span>
-        </button>
         <button class="icon-button mobile-only" id="mobile-sidebar" aria-label="打开侧栏">
           <span data-icon="menu"></span>
         </button>
         <button class="agent-selector" id="agent-selector" aria-haspopup="menu" aria-expanded="false">
-          <span class="agent-selector-icon" data-icon="sparkles"></span>
           <span class="agent-selector-copy">
             <strong id="agent-name">选择智能体</strong>
-            <small id="agent-version">准备就绪</small>
           </span>
           <span class="chevron" data-icon="chevronDown" data-icon-size="15"></span>
         </button>
         <div class="agent-menu" id="agent-menu" role="menu"></div>
         <div class="header-spacer"></div>
-        <div class="connection-state"><i></i><span>本地工作区</span></div>
-        <button class="header-action" id="details-toggle" title="运行详情" aria-label="查看运行详情">
-          <span data-icon="history"></span><span>运行详情</span>
+        <button class="header-action" id="details-toggle" title="查看过程" aria-label="查看运行详情" aria-controls="run-drawer" aria-expanded="false" hidden>
+          <span data-icon="history"></span><span>查看过程</span>
         </button>
       </header>
 
@@ -134,7 +136,8 @@
       </aside>
 
       <section class="composer-wrap">
-        <section class="turn-progress-dock" id="turn-progress-dock" aria-live="polite" hidden>
+        <div class="composer-status-row" aria-label="任务进度和阅读位置">
+          <section class="turn-progress-dock" id="turn-progress-dock" aria-live="polite" hidden>
           <div class="turn-progress-card" id="turn-progress-card" role="status"
             aria-label="当前任务计划">
             <div class="turn-progress-steps" id="turn-progress-steps" role="list"></div>
@@ -145,25 +148,27 @@
             <i aria-hidden="true"></i>
             <span id="turn-progress-count">第 1 / 1 步</span>
           </button>
-        </section>
+          </section>
+          <button class="jump-to-latest" id="jump-to-latest" type="button" hidden>
+            <span aria-hidden="true">↓</span> 回到最新
+          </button>
+        </div>
         <div class="picker-popover command-palette" id="resource-picker" role="listbox"></div>
-        <div class="model-menu" id="model-menu" role="menu" aria-label="选择模型"></div>
-        <div class="approval-policy-menu" id="approval-policy-menu" role="menu" aria-label="选择批准策略">
-          <button type="button" data-approval-policy="ask" role="menuitemradio">
-            <span class="approval-policy-icon" data-icon="shield"></span>
-            <span><strong>请求批准</strong><small>所有有副作用的操作都会先征求你的批准</small></span>
-            <span class="approval-policy-check" data-icon="check" data-icon-size="16"></span>
-          </button>
-          <button type="button" data-approval-policy="auto" role="menuitemradio">
-            <span class="approval-policy-icon" data-icon="sparkles"></span>
-            <span><strong>帮我批准</strong><small>低风险工作区操作自动执行，外部或高风险操作仍会询问</small></span>
-            <span class="approval-policy-check" data-icon="check" data-icon-size="16"></span>
-          </button>
-          <button type="button" data-approval-policy="full_access" role="menuitemradio">
-            <span class="approval-policy-icon danger" data-icon="shield"></span>
-            <span><strong>完全访问权限</strong><small>不再逐次询问；既有工具授权、隔离工作区和平台安全边界仍然生效</small></span>
-            <span class="approval-policy-check" data-icon="check" data-icon-size="16"></span>
-          </button>
+        <div class="approval-policy-menu" id="approval-policy-menu" role="menu" aria-label="批准策略" hidden></div>
+        <div class="reasoning-menu" id="reasoning-menu" role="dialog" aria-label="模型与推理强度" hidden>
+          <div class="reasoning-menu-head">
+            <button class="reasoning-model-link" id="reasoning-model-btn" type="button" aria-label="更换模型" aria-controls="model-menu" aria-expanded="false">
+              <span class="reasoning-current"><strong id="reasoning-current-label">默认</strong><span data-icon="chevronDown" data-icon-size="14"></span></span>
+              <span class="reasoning-current-model" id="reasoning-current-model"></span>
+            </button>
+            <button class="icon-button reasoning-reset" id="reasoning-reset" type="button" title="重置为模型默认强度" aria-label="重置为模型默认强度"><span data-icon="restore" data-icon-size="19"></span></button>
+          </div>
+          <div class="model-menu" id="model-menu" role="menu" aria-label="模型" hidden></div>
+          <div class="reasoning-slider-wrap" id="reasoning-slider-wrap">
+            <div class="reasoning-slider-track" aria-hidden="true"><div class="reasoning-slider-fill" id="reasoning-slider-fill"></div><div class="reasoning-slider-energy" id="reasoning-slider-energy"></div><div class="reasoning-slider-ticks" id="reasoning-slider-ticks"></div></div>
+            <input id="reasoning-slider" type="range" min="0" max="0" step="1" value="0" aria-label="推理强度" aria-valuetext="默认" />
+          </div>
+          <p class="reasoning-unavailable" id="reasoning-unavailable" hidden></p>
         </div>
         <div class="composer-add-menu" id="composer-add-menu" role="menu" aria-label="添加内容">
           <label class="composer-menu-item" role="menuitem">
@@ -176,7 +181,7 @@
             <span><strong>引用内容</strong><small>选择知识库或模板</small></span>
           </button>
           <button class="composer-menu-item" id="command-btn" role="menuitem">
-            <b>/</b>
+            <span data-icon="blocks"></span>
             <span><strong>调用能力</strong><small>选择 Skill、MCP 或智能体</small></span>
           </button>
         </div>
@@ -189,7 +194,7 @@
           <div class="attachment-pills" id="attach-chips" aria-live="polite"></div>
           <div class="composer-editor" id="composer-editor">
             <div class="context-pills" id="mention-pills" aria-label="已引用和调用的内容，光标在正文开头时可按 Backspace 移除"></div>
-            <textarea id="query" rows="1" placeholder="随心输入" aria-label="消息内容"></textarea>
+            <textarea id="query" rows="2" placeholder="随心输入" aria-label="消息内容"></textarea>
           </div>
           <div class="composer-toolbar">
             <div class="composer-primary-actions">
@@ -197,45 +202,45 @@
                 aria-haspopup="menu" aria-expanded="false">
                 <span data-icon="plus"></span>
               </button>
-              <button class="composer-icon approval-policy-button" id="approval-policy-btn" title="批准策略"
-                aria-label="选择批准策略" aria-haspopup="menu" aria-expanded="false">
-                <span data-icon="shield" data-icon-size="15"></span>
-                <span class="approval-policy-label" id="approval-policy-label">请求批准</span>
-                <span data-icon="chevronDown" data-icon-size="11"></span>
+              <button class="composer-icon approval-policy-button" id="approval-policy-btn" title="批准策略" aria-label="选择批准策略" aria-controls="approval-policy-menu" aria-haspopup="menu" aria-expanded="false">
+                <span data-icon="shield" data-icon-size="18"></span><span class="approval-policy-label" id="approval-policy-label">请求批准</span>
               </button>
             </div>
             <div class="composer-tools">
-              <button class="composer-icon model-select-button" id="model-btn" title="选择模型"
-                aria-label="选择模型" aria-haspopup="menu" aria-expanded="false">
-                <span data-icon="sparkles"></span>
-                <span class="model-select-label" id="model-btn-label">模型</span>
-                <span data-icon="chevronDown" data-icon-size="12"></span>
+              <button class="composer-icon model-select-button" id="model-btn" title="模型与推理强度" aria-label="选择模型与推理强度" aria-controls="reasoning-menu" aria-haspopup="dialog" aria-expanded="false">
+                <span class="model-select-label" id="model-btn-label">智能体自动</span><span class="reasoning-effort-label" id="reasoning-effort-label" hidden></span><span data-icon="chevronDown" data-icon-size="12"></span>
               </button>
-              <button class="composer-icon" id="mic-btn" title="语音输入" aria-label="开始语音输入">
-                <span data-icon="mic"></span>
-              </button>
+              <button class="composer-icon" id="mic-btn" title="语音输入" aria-label="开始语音输入"><span data-icon="mic"></span></button>
               <button class="send-action" id="send-btn" title="开始语音输入" aria-label="开始语音输入">
                 <span data-icon="waveform"></span>
               </button>
             </div>
           </div>
         </div>
-        <p class="composer-hint">智能体可能会出错，请核验重要信息。</p>
+        <p class="composer-hint">重要信息请核实。</p>
       </section>
     </main>
 
-    <aside class="run-drawer" id="run-drawer">
+    <aside class="run-drawer" id="run-drawer" aria-label="运行详情" aria-hidden="true" inert>
       <div class="drawer-head">
         <div>
-          <span class="eyebrow">HARNESS OBSERVABILITY</span>
+          <span class="eyebrow">任务执行记录</span>
           <strong>运行详情</strong>
           <span id="run-status">尚未运行</span>
         </div>
         <button class="icon-button" id="drawer-close" aria-label="关闭运行详情"><span data-icon="close"></span></button>
       </div>
-      <p class="drawer-copy">这里只展示可审计的执行事件、版本与结果状态，不暴露内部推理。</p>
+      <p class="drawer-copy">按实际执行查看当前阶段、操作记录和验证结果。</p>
       <div class="run-summary" id="run-summary"></div>
+      <section class="run-phase-summary" id="run-phase-summary" aria-label="任务阶段" hidden></section>
       <section class="evidence-center" id="evidence-center" aria-label="Evidence Tree" hidden></section>
+      <div class="run-event-filters" id="run-event-filters" role="group" aria-label="筛选执行记录">
+        <button type="button" data-event-filter="all" aria-pressed="true">全部</button>
+        <button type="button" data-event-filter="tools" aria-pressed="false">工具</button>
+        <button type="button" data-event-filter="approval" aria-pressed="false">审批</button>
+        <button type="button" data-event-filter="verification" aria-pressed="false">验证</button>
+      </div>
+      <p class="run-events-empty" id="run-events-empty">暂无执行记录，发送任务后可在这里查看。</p>
       <div class="run-events" id="run-events"></div>
     </aside>
   </div>
@@ -253,38 +258,6 @@
     <button id="project-context-archive-btn" role="menuitem"><span data-icon="archive"></span>归档</button>
   </div>
 
-  <dialog id="project-dialog" class="compact-dialog">
-    <h3 id="project-dialog-title">新建项目</h3>
-    <p class="dialog-copy">项目可集中管理同一主题下的对话，并提供默认 Agent、知识库和低权重背景。</p>
-    <label for="project-name">项目名称</label>
-    <input id="project-name" maxlength="80" placeholder="例如：产品发布计划" />
-    <label for="project-description">目标说明</label>
-    <textarea id="project-description" maxlength="500" placeholder="项目要达成什么结果"></textarea>
-    <label for="project-context">项目背景</label>
-    <textarea id="project-context" maxlength="8000" placeholder="仅作为用户层参考上下文，不会提升为系统指令"></textarea>
-    <label for="project-agent">默认智能体</label><select id="project-agent"><option value="">沿用当前选择</option></select>
-    <label>默认知识库</label><div id="project-datasets" class="choice-grid"></div>
-    <label><input id="project-default" type="checkbox" /> 设为默认项目</label>
-    <div class="error" id="project-error"></div>
-    <div class="dialog-actions">
-      <button class="btn ghost" id="project-cancel-btn">取消</button>
-      <button class="btn" id="project-create-btn">保存项目</button>
-    </div>
-  </dialog>
-
-  <dialog id="memory-dialog" class="compact-dialog memory-dialog">
-    <h3>对话记忆治理</h3>
-    <p class="dialog-copy">控制当前对话是否接收长期记忆，以及是否允许其内容成为其他对话的记忆来源。排除来源不会删除 Turn/Item 审计。</p>
-    <label><input id="memory-recall-enabled" type="checkbox" /> 当前对话允许召回长期记忆</label>
-    <label><input id="memory-source-enabled" type="checkbox" /> 当前对话可作为记忆来源</label>
-    <div id="memory-summary" class="memory-summary"></div>
-    <div class="dialog-actions">
-      <button class="btn ghost" id="memory-export-btn">导出我的记忆</button>
-      <button class="btn danger" id="memory-forget-btn">排除来源</button>
-      <button class="btn" id="memory-save-btn">保存</button>
-    </div>
-  </dialog>
-
   <dialog id="rename-thread-dialog" class="compact-dialog">
     <h3>重命名对话</h3>
     <label for="rename-thread-name">对话名称</label>
@@ -297,6 +270,9 @@
   </dialog>
 
   <script src="/static/common.js"></script>
+  <script src="/static/guardrail-notifications.js" defer></script>
+  <script src="/static/run-workspace.js"></script>
+  <script src="/static/chat-workspace.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

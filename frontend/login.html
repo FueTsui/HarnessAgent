@@ -7,6 +7,8 @@
   <link id="brand-favicon" rel="icon" href="__BRAND_LOGO_URL__" />
   <link rel="manifest" href="/branding/site.webmanifest" />
   <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/desktop-ui.css" />
+  <script src="/static/desktop-ui.js" defer></script>
 </head>
 <body class="login-page">
   <button class="login-theme icon-button" id="login-theme" aria-label="切换外观"><span data-theme-icon></span></button>
@@ -16,12 +18,12 @@
       <div class="sub">HARNESS AGENT WORKSPACE</div>
       <h1>欢迎回来</h1>
       <p class="login-copy">登录后继续你的对话、知识任务与智能体运行。</p>
-      <label>用户名</label>
+      <label for="username">用户名</label>
       <input type="text" id="username" placeholder="请输入用户名" autocomplete="username" />
-      <label>密码</label>
+      <label for="password">密码</label>
       <input type="password" id="password" placeholder="请输入密码" autocomplete="current-password" />
       <button class="btn block" id="login-btn">登录工作台</button>
-      <div class="error" id="error"></div>
+      <div class="error" id="error" role="alert"></div>
       <div class="login-security"><span data-icon="shield" data-icon-size="14"></span>凭据仅发送至当前服务</div>
     </div>
   </div>

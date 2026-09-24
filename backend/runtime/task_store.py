@@ -5,7 +5,8 @@ import datetime
 import json
 import uuid
 
-from sqlalchemy import func
+from sqlalchemy import func, update
+from sqlalchemy.orm.attributes import set_committed_value
 
 from ..models import Item, Thread, Turn
 
@@ -92,8 +93,21 @@ def append_item(
     content: str = "",
     payload: dict | None = None,
 ) -> Item:
-    sequence = int(turn.item_sequence or 0) + 1
-    turn.item_sequence = sequence
+    # Progress, model events and child agents use independent short sessions.
+    # Their Turn objects may all contain the same old item_sequence. Allocate at
+    # the database row instead, under the caller's transaction, so concurrent
+    # writers cannot reserve the same sequence or overwrite a newer counter.
+    with db.no_autoflush:
+        sequence = db.execute(
+            update(Turn)
+            .where(Turn.id == turn.id)
+            .values(item_sequence=func.coalesce(Turn.item_sequence, 0) + 1)
+            .returning(Turn.item_sequence)
+            .execution_options(synchronize_session=False)
+        ).scalar_one()
+    # This value was already persisted by UPDATE. Mark it committed in the ORM
+    # mirror so a later flush cannot turn the atomic increment into a stale SET.
+    set_committed_value(turn, "item_sequence", sequence)
     item = Item(
         id=uuid.uuid4().hex,
         thread_id=turn.thread_id,
@@ -116,7 +130,7 @@ def append_runtime_item(
     turn = db.get(Turn, turn_id)
     if turn is None:
         return None
-    event = payload or {}
+    event = dict(payload or {})
     kind = "event"
     role = ""
     name = event_type
@@ -134,12 +148,17 @@ def append_runtime_item(
             "step.skipped": "skipped",
         }.get(event_type, "completed")
     elif event_type.startswith("tool."):
+        # Item.name is the actual tool for audit queries; retain the lifecycle
+        # identity separately so live streams and replay produce the same events.
+        event["_event_type"] = event_type
         kind = "tool_call" if event_type == "tool.called" else "tool_result"
         name = str(event.get("tool") or event_type)
         if event_type == "tool.called":
             status = "started"
         elif event_type == "tool.deferred":
             status = "deferred"
+        elif event_type == "tool.rejected":
+            status = "failed"
         else:
             status = "completed" if event.get("ok", True) else "failed"
     elif event_type.startswith("approval."):

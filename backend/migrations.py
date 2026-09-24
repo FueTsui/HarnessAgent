@@ -16,7 +16,7 @@ from .database import engine
 _LOCK_TIMEOUT_SECONDS = 60
 _STALE_LOCK_SECONDS = 600
 _POSTGRES_LOCK_ID = 0x4841524E455353  # "HARNESS"
-EXPECTED_SCHEMA_REVISION = "0019_release_reliability"
+EXPECTED_SCHEMA_REVISION = "0029_retire_guest_access"
 
 
 @contextlib.contextmanager

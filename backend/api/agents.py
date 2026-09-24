@@ -13,7 +13,9 @@ from ..models import (
     Job, McpServer, ModelProvider, Project, Skill, Thread, Turn, User,
 )
 from ..capabilities import knowledge
+from ..guest_access import guest_agent, is_guest
 from ..model_governance import resolve_route, validate_policy_routing
+from ..model_roles import EXECUTION_KEYS, normalize_execution_options, validate_role_parameter_support
 from ..resource_governance import resource_state
 from ..runtime import builtin_tools
 from ..schemas import (
@@ -190,7 +192,46 @@ def _parse_ids_param(ids: str) -> list[int]:
     return selected
 
 
-def _validate_routing_refs(db: Session, user: User, routing: dict) -> dict:
+def _validate_routing_refs(db: Session, user: User, routing: dict, *, primary_provider_id: int | None = None) -> dict:
+    if not isinstance(routing, dict):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "模型路由必须为对象")
+    if routing.get("mode", "fixed") not in {"fixed", "rules", "policy"}:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "模型路由模式无效")
+    if not any(key in routing for key in EXECUTION_KEYS) and routing.get("version") != 2:
+        return _validate_provider_routing_refs(db, user, routing)
+
+    def validate_provider(provider_id):
+        _validate_refs(db, user, provider_id=provider_id, mcp_ids=None, skill_ids=None)
+
+    def validate_role_provider(provider_id):
+        validate_provider(provider_id)
+        provider = db.get(ModelProvider, provider_id)
+        if not provider.enabled or not provider.model_id:
+            raise ValueError("阶段模型必须已启用且配置模型名称")
+
+    try:
+        # Preserve inactive advanced configuration when switching modes, while
+        # still authorizing every stored provider reference before it is saved.
+        base = validate_policy_routing(db, user, {**routing, "mode": "policy"}, validate_provider)
+        if isinstance(routing.get("health"), dict):
+            base["health"] = {**routing["health"], **base["health"]}
+        options = normalize_execution_options(routing, validate_role_provider)
+        inherited_ids = {primary_provider_id}
+        if routing.get("mode") in {"rules", "policy"}:
+            inherited_ids.add(base["default_provider_id"])
+            inherited_ids.update(rule["provider_id"] for rule in base["rules"])
+        if routing.get("mode") == "policy":
+            inherited_ids.update(base["fallback_provider_ids"])
+        for name, spec in options["roles"].items():
+            for provider_id in ({spec["provider_id"]} if spec["provider_id"] else inherited_ids):
+                provider = db.get(ModelProvider, provider_id) if provider_id else None
+                validate_role_parameter_support(provider, spec, name)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    return {**routing, **base, "mode": routing.get("mode", "fixed"), "version": 2, **options}
+
+
+def _validate_provider_routing_refs(db: Session, user: User, routing: dict) -> dict:
     if isinstance(routing, dict) and routing.get("mode") == "policy":
         def validate_provider(provider_id: int) -> None:
             _validate_refs(
@@ -291,9 +332,27 @@ def agent_mcp_servers(db: Session, agent: Agent, extra_ids=None) -> list[McpServ
 
 # ---------- 普通用户可见 ----------
 
+@router.get("/model-options")
+def agent_model_options(admin: User = Depends(require_module("agents")), db: Session = Depends(get_db)):
+    """Minimal reference catalog for agent editors without provider-admin access."""
+    from ..reasoning_options import reasoning_capabilities
+    from ..guest_access import effective_reasoning_provider
+    providers = scope_owned(db.query(ModelProvider), ModelProvider, admin).filter(
+        ModelProvider.enabled.is_(True),
+    ).order_by(ModelProvider.name, ModelProvider.id).all()
+    return [{"id": provider.id, "name": provider.name, "model_id": provider.model_id,
+             "enabled": bool(provider.enabled), **reasoning_capabilities(effective_reasoning_provider(provider))}
+            for provider in providers if provider.model_id]
+
+
 @router.get("/enabled", response_model=list[AgentOut])
 def list_enabled_agents(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """对话页可选智能体：root 见全部已启用；其他用户仅见「默认智能体」与「已开放(public)」的。"""
+    if is_guest(user):
+        row = guest_agent(db, user)
+        return [AgentOut(id=row.id, name="访客助手", description="独立浏览器对话",
+                         system_prompt="", opening_statement="", enabled=True,
+                         active_version=row.active_version, can_manage=False)]
     q = db.query(Agent).filter(Agent.enabled.is_(True))
     if not is_root(user):
         q = q.filter((Agent.is_default.is_(True)) | (Agent.is_public.is_(True)))
@@ -345,7 +404,7 @@ async def import_agents(
             _validate_builtin_tools(admin, d.get("builtin_tools"))
             if "builtin_tools" in d else []
         )
-        routing = _validate_routing_refs(db, admin, d.get("routing") or {})
+        routing = _validate_routing_refs(db, admin, d.get("routing") or {}, primary_provider_id=provider_id)
         _validate_refs(
             db, admin, provider_id=provider_id,
             mcp_ids=mcp_ids, skill_ids=skill_ids, agent_ids=agent_ids,
@@ -395,6 +454,7 @@ def create_agent(body: AgentCreate, admin: User = Depends(require_module("agents
         mcp_ids=body.mcp_ids, skill_ids=body.skill_ids, agent_ids=body.agent_ids,
     )
     assigned_tools = _validate_builtin_tools(admin, body.builtin_tools)
+    routing = _validate_routing_refs(db, admin, body.routing or {}, primary_provider_id=body.provider_id)
     agent = Agent(
         name=body.name,
         description=body.description,
@@ -406,7 +466,7 @@ def create_agent(body: AgentCreate, admin: User = Depends(require_module("agents
         agent_ids=json.dumps(body.agent_ids or [], ensure_ascii=False),
         builtin_tools=json.dumps(assigned_tools, ensure_ascii=False),
         memory_enabled=body.memory_enabled,
-        routing=json.dumps(body.routing or {}, ensure_ascii=False) if body.routing else "",
+        routing=json.dumps(routing, ensure_ascii=False) if routing else "",
         is_public=body.is_public,
         created_by=admin.id,
     )
@@ -500,8 +560,11 @@ def update_agent(
         agent.builtin_tools = json.dumps(assigned_tools, ensure_ascii=False)
     if body.memory_enabled is not None:
         agent.memory_enabled = body.memory_enabled
-    if body.routing is not None:
-        routing = _validate_routing_refs(db, admin, body.routing)
+    if body.routing is not None or body.clear_provider or body.provider_id is not None:
+        routing = _validate_routing_refs(
+            db, admin, body.routing if body.routing is not None else _loads(agent.routing, {}),
+            primary_provider_id=agent.provider_id,
+        )
         agent.routing = json.dumps(routing, ensure_ascii=False) if routing else ""
     if body.is_public is not None:
         agent.is_public = body.is_public
