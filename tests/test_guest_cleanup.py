@@ -29,7 +29,7 @@ from backend.security import get_current_user
 class GuestCleanupTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.rootdir = Path(self.temp.name)
+        self.rootdir = Path(self.temp.name).resolve()
         self.patches = []
         for name in ("UPLOAD_DIR", "EXPORT_DIR", "WORKSPACE_DIR", "KNOWLEDGE_DIR"):
             directory = self.rootdir / name.lower()

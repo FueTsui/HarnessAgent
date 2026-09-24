@@ -50,7 +50,7 @@ class KnowledgeRetirementTests(unittest.TestCase):
         self.assertEqual(result["projects_updated"], 1)
         self.assertTrue(db.committed)
         self.assertEqual(json.loads(project.dataset_ids), ["law"])
-        self.assertEqual(json.loads(knowledge.DATASETS_META.read_text()), {"law": law})
+        self.assertEqual(json.loads(knowledge.DATASETS_META.read_text(encoding="utf-8")), {"law": law})
         self.assertEqual((self.root / "law/document.txt").read_bytes(), before)
         self.assertFalse((self.root / "green").exists())
         self.assertFalse((self.root / "vpp").exists())

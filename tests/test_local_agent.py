@@ -23,7 +23,7 @@ class LocalAgentTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.home = self.root / "独立数据"
 
     def test_home_initialization_preserves_secrets_and_user_branding(self):
