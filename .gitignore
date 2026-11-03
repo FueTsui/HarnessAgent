@@ -30,6 +30,7 @@ Thumbs.db
 # Local reference checkout and private acceptance evidence
 deepseek-harness/
 design-qa.md
+/设计/
 docs/*2026*/
 docs/*2026*.md
 docs/explicit-mcp-routing-fix.md
