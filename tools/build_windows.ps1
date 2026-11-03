@@ -158,10 +158,26 @@ foreach ($scriptFolder in @('bin', 'Scripts')) {
 
 foreach ($folder in @('backend', 'frontend', 'migrations')) { Copy-AppTree $folder }
 if (Test-Path -LiteralPath (Join-Path $workspace 'packaging\defaults')) { Copy-AppTree 'packaging\defaults' }
-foreach ($relative in @('alembic.ini', 'run.py', 'local_agent.py', 'requirements.lock', 'requirements.txt', 'README.md', 'RELEASE.md', 'LICENSE', 'LICENSE.md', 'LICENSE.txt')) {
+foreach ($relative in @('alembic.ini', 'run.py', 'local_agent.py', 'requirements.lock', 'requirements.txt', 'README.md', 'RELEASE.md', 'ARCHITECTURE_HARNESS_2026-07-29.md', 'LICENSE', 'LICENSE.md', 'LICENSE.txt')) {
     $source = Join-Path $workspace $relative
     $null = Assert-ChildPath $source $workspace
     if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Item -LiteralPath $source -Destination (Join-Path $appRoot $relative) }
+}
+# Keep the README's public documentation links available in the runtime bundle.
+# Use an explicit allowlist so private acceptance evidence is never copied.
+$publicDocs = @(
+    'USAGE.md',
+    'local-agent-windows.md',
+    'agent-model-routing.md',
+    'execution-runtime-upgrade.md'
+)
+$appDocs = Join-Path $appRoot 'docs'
+$null = New-Item -ItemType Directory -Force -Path $appDocs
+foreach ($document in $publicDocs) {
+    $source = Join-Path (Join-Path $workspace 'docs') $document
+    $null = Assert-ChildPath $source $workspace
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing public documentation: $source" }
+    Copy-Item -LiteralPath $source -Destination (Join-Path $appDocs $document)
 }
 $guide = Join-Path $workspace 'docs\local-agent-windows.md'
 $null = Assert-ChildPath $guide $workspace
